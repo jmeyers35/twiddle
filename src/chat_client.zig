@@ -8,9 +8,10 @@ pub const ChatClient = struct {
 
     pub const Config = struct {
         api_key_env: []const u8 = "OPENAI_API_KEY",
-        base_url: []const u8 = "https://openrouter.ai/api",
+        api_key: ?[]const u8 = null,
+        base_url: []const u8,
         path: []const u8 = "/v1/chat/completions",
-        model: []const u8 = "openrouter/polaris-alpha",
+        model: []const u8,
         temperature: f32 = 0.15,
         max_completion_tokens: ?u32 = 512,
         unix_socket_path: []const u8 = "",
@@ -464,18 +465,29 @@ pub const ChatClient = struct {
     }
 
     fn buildAuthHeader(allocator: Allocator, config: Config) ![]u8 {
+        if (config.api_key) |key| {
+            if (key.len == 0) return error.ApiKeyMissing;
+            return buildBearerHeader(allocator, key);
+        }
+
         const key_owned = std.process.getEnvVarOwned(allocator, config.api_key_env) catch |err| switch (err) {
             error.EnvironmentVariableNotFound => return error.ApiKeyMissing,
             else => return err,
         };
-        defer allocator.free(key_owned);
+        defer {
+            crypto.secureZero(u8, key_owned);
+            allocator.free(key_owned);
+        }
         if (key_owned.len == 0) return error.ApiKeyMissing;
 
+        return buildBearerHeader(allocator, key_owned);
+    }
+
+    fn buildBearerHeader(allocator: Allocator, key: []const u8) ![]u8 {
         const prefix = "Bearer ";
-        var header = try allocator.alloc(u8, prefix.len + key_owned.len);
+        var header = try allocator.alloc(u8, prefix.len + key.len);
         @memcpy(header[0..prefix.len], prefix);
-        @memcpy(header[prefix.len..], key_owned);
-        crypto.secureZero(u8, key_owned);
+        @memcpy(header[prefix.len..], key);
         return header;
     }
 

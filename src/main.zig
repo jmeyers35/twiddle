@@ -1,5 +1,6 @@
 const std = @import("std");
 const ChatClient = @import("chat_client.zig").ChatClient;
+const Config = @import("config.zig");
 
 pub fn main() !void {
     const stdin = std.fs.File.stdin();
@@ -17,10 +18,37 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var chat_client = ChatClient.init(gpa.allocator(), .{}) catch |err| switch (err) {
+    const config_path = try Config.defaultConfigPath(gpa.allocator());
+    defer if (config_path) |p| gpa.allocator().free(p);
+
+    var runtime_config = Config.load(gpa.allocator(), config_path) catch |err| switch (err) {
+        error.ConfigParseFailed => {
+            try emitConfigError(output_stream, "Failed to parse twiddle config", config_path);
+            try output_stream.flush();
+            return err;
+        },
+        error.ConfigTooLarge => {
+            try emitConfigError(output_stream, "Config file exceeds 64KiB limit", config_path);
+            try output_stream.flush();
+            return err;
+        },
+        else => return err,
+    };
+    defer runtime_config.deinit(gpa.allocator());
+
+    var chat_client = ChatClient.init(gpa.allocator(), .{
+        .base_url = runtime_config.base_url,
+        .model = runtime_config.model,
+        .api_key = runtime_config.api_key,
+    }) catch |err| switch (err) {
         error.ApiKeyMissing => {
-            try output_stream.writeAll("\nMissing OPENAI_API_KEY environment variable (ChatClient.Config.api_key_env).\n");
-            try output_stream.writeAll("Set it to your OpenAI key before running twiddle.\n");
+            try output_stream.writeAll("\nMissing API key. Set OPENAI_API_KEY or add api_key to ");
+            if (config_path) |p| {
+                try output_stream.writeAll(p);
+            } else {
+                try output_stream.writeAll("~/.twiddle/twiddle.toml");
+            }
+            try output_stream.writeAll(".\n");
             try output_stream.flush();
             return err;
         },
@@ -63,4 +91,16 @@ pub fn main() !void {
         try output_stream.writeAll("\n");
         try output_stream.flush();
     }
+}
+
+fn emitConfigError(writer: anytype, message: []const u8, config_path: ?[]const u8) !void {
+    try writer.writeAll("\n");
+    try writer.writeAll(message);
+    try writer.writeAll(" (");
+    if (config_path) |p| {
+        try writer.writeAll(p);
+    } else {
+        try writer.writeAll("~/.twiddle/twiddle.toml");
+    }
+    try writer.writeAll(").\n");
 }
