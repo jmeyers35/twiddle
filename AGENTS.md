@@ -12,3 +12,7 @@ This is `twiddle`, and we're on a mission to build the best and most efficient c
 
 ## Evaluating Performance
 - We'll use terminalbench to evaluate Agent effectiveness.
+
+## Development
+
+- Always run `zlint` after making changes.
