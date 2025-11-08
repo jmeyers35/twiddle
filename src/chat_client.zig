@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_context = @import("model_context.zig");
+const Tools = @import("tools.zig");
 const testing = std.testing;
 
 pub const ChatClient = struct {
@@ -15,7 +16,7 @@ pub const ChatClient = struct {
         path: []const u8 = "/v1/chat/completions",
         model: []const u8,
         temperature: f32 = 0.15,
-        max_completion_tokens: ?u32 = 512,
+        max_completion_tokens: ?u32 = null,
         unix_socket_path: []const u8 = "",
         system_prompt: []const u8 =
             "You are twiddle, an extremely efficient coding agent. " ++ "Answer with concise, accurate steps and code when needed.",
@@ -39,12 +40,139 @@ pub const ChatClient = struct {
     last_rtt_ns: u64 = 2 * std.time.ns_per_s,
     model_context_limit: ?u32 = null,
     messages: std.ArrayListUnmanaged(Message) = .empty,
+    tool_context: []u8 = &.{},
 
-    const Role = enum { user, assistant };
+    const Role = enum { user, assistant, tool };
+
+    const ToolCall = struct {
+        id: []u8,
+        name: []u8,
+        arguments_json: []u8,
+    };
 
     const Message = struct {
         role: Role,
-        content: []u8,
+        content: []u8 = &.{},
+        content_is_null: bool = false,
+        tool_call_id: []u8 = &.{},
+        tool_name: []u8 = &.{},
+        tool_calls: []ToolCall = &.{},
+        processed_tool_calls: usize = 0,
+
+        fn deinit(self: *Message, allocator: Allocator) void {
+            switch (self.role) {
+                .tool => {
+                    if (self.tool_call_id.len != 0) allocator.free(self.tool_call_id);
+                    if (self.tool_name.len != 0) allocator.free(self.tool_name);
+                },
+                else => {},
+            }
+
+            if (self.tool_calls.len != 0) {
+                for (self.tool_calls) |call| {
+                    if (call.id.len != 0) allocator.free(call.id);
+                    if (call.name.len != 0) allocator.free(call.name);
+                    if (call.arguments_json.len != 0) allocator.free(call.arguments_json);
+                }
+                allocator.free(self.tool_calls);
+            }
+
+            if (self.content.len != 0) allocator.free(self.content);
+            self.* = undefined;
+        }
+    };
+
+    const ToolCallAccumulator = struct {
+        const Partial = struct {
+            id: []u8 = &.{},
+            name: []u8 = &.{},
+            arguments: std.ArrayListUnmanaged(u8) = .{},
+        };
+
+        calls: std.ArrayListUnmanaged(Partial) = .{},
+
+        fn deinit(self: *ToolCallAccumulator, allocator: Allocator) void {
+            if (self.calls.items.len == 0) return;
+            for (self.calls.items[0..self.calls.items.len]) |*partial| {
+                if (partial.id.len != 0) allocator.free(partial.id);
+                if (partial.name.len != 0) allocator.free(partial.name);
+                partial.arguments.deinit(allocator);
+                partial.* = Partial{};
+            }
+            self.calls.deinit(allocator);
+            self.* = ToolCallAccumulator{};
+        }
+
+        fn acquire(self: *ToolCallAccumulator, allocator: Allocator, index: usize) (Allocator.Error || error{StreamFormat})!*Partial {
+            while (self.calls.items.len <= index) {
+                try self.calls.append(allocator, Partial{});
+            }
+            return &self.calls.items[index];
+        }
+
+        fn setId(_: *ToolCallAccumulator, allocator: Allocator, partial: *Partial, id: []const u8) (Allocator.Error || error{StreamFormat})!void {
+            if (id.len == 0) return error.StreamFormat;
+            if (partial.id.len == 0) {
+                partial.id = try dupSlice(allocator, id);
+                return;
+            }
+            if (!std.mem.eql(u8, partial.id, id)) return error.StreamFormat;
+        }
+
+        fn setName(_: *ToolCallAccumulator, allocator: Allocator, partial: *Partial, name: []const u8) (Allocator.Error || error{StreamFormat})!void {
+            if (name.len == 0) return error.StreamFormat;
+            if (partial.name.len == 0) {
+                partial.name = try dupSlice(allocator, name);
+                return;
+            }
+            if (!std.mem.eql(u8, partial.name, name)) return error.StreamFormat;
+        }
+
+        fn appendArguments(_: *ToolCallAccumulator, allocator: Allocator, partial: *Partial, chunk: []const u8) Allocator.Error!void {
+            if (chunk.len == 0) return;
+            try partial.arguments.appendSlice(allocator, chunk);
+        }
+
+        fn take(self: *ToolCallAccumulator, allocator: Allocator) (Allocator.Error || error{StreamFormat})![]ToolCall {
+            const count = self.calls.items.len;
+            if (count == 0) {
+                self.calls.deinit(allocator);
+                self.* = ToolCallAccumulator{};
+                return &.{};
+            }
+
+            var idx: usize = 0;
+            const out = try allocator.alloc(ToolCall, count);
+            errdefer {
+                freeToolCalls(allocator, out[0..idx]);
+                allocator.free(out);
+            }
+
+            while (idx < count) : (idx += 1) {
+                var partial = &self.calls.items[idx];
+                if (partial.id.len == 0 or partial.name.len == 0) return error.StreamFormat;
+
+                const args_len = partial.arguments.items.len;
+                const args_slice = try allocator.alloc(u8, args_len);
+                if (args_len != 0) {
+                    @memcpy(args_slice[0..args_len], partial.arguments.items[0..args_len]);
+                }
+
+                out[idx] = ToolCall{
+                    .id = partial.id,
+                    .name = partial.name,
+                    .arguments_json = args_slice,
+                };
+
+                partial.id = &.{};
+                partial.name = &.{};
+                partial.arguments.deinit(allocator);
+            }
+
+            self.calls.deinit(allocator);
+            self.* = ToolCallAccumulator{};
+            return out;
+        }
     };
 
     const min_timeout_ns: u64 = 750 * std.time.ns_per_ms;
@@ -87,6 +215,9 @@ pub const ChatClient = struct {
             crypto.secureZero(u8, self.auth_header);
             self.allocator.free(self.auth_header);
         }
+        if (self.tool_context.len != 0) {
+            self.allocator.free(self.tool_context);
+        }
         self.* = undefined;
     }
 
@@ -96,14 +227,17 @@ pub const ChatClient = struct {
         var snapshot = MessageSnapshot.init(self);
         defer snapshot.cancel();
 
-        try self.appendMessage(.user, user_input);
+        try self.appendUserMessage(user_input);
 
         var attempts: u8 = 0;
         while (true) : (attempts += 1) {
             var assistant_buf = std.ArrayListUnmanaged(u8){};
             defer assistant_buf.deinit(self.allocator);
 
-            const result = self.tryRespond(writer, &assistant_buf) catch |err| switch (err) {
+            var tool_accum = ToolCallAccumulator{};
+            defer tool_accum.deinit(self.allocator);
+
+            const result = self.tryRespond(writer, &assistant_buf, &tool_accum) catch |err| switch (err) {
                 error.UpstreamRejected => |e| {
                     try emitErrorLine(writer, "upstream error", e);
                     return;
@@ -113,7 +247,50 @@ pub const ChatClient = struct {
 
             switch (result) {
                 .success => {
-                    try self.appendMessage(.assistant, assistant_buf.items);
+                    const tool_calls = try tool_accum.take(self.allocator);
+                    const content_is_null = tool_calls.len != 0 and assistant_buf.items.len == 0;
+                    try self.appendAssistantMessage(assistant_buf.items, tool_calls, content_is_null);
+                    snapshot.commit();
+                    return;
+                },
+                .retryable => {
+                    if (attempts >= 1) {
+                        try emitErrorLine(writer, "upstream temporarily unavailable, retry limit hit", null);
+                        return;
+                    }
+                    try writer.writeAll("…retrying…\n");
+                    try writer.flush();
+                    continue;
+                },
+            }
+        }
+    }
+
+    pub fn continueConversation(self: *ChatClient, writer: *Writer) !void {
+        var snapshot = MessageSnapshot.init(self);
+        defer snapshot.cancel();
+
+        var attempts: u8 = 0;
+        while (true) : (attempts += 1) {
+            var assistant_buf = std.ArrayListUnmanaged(u8){};
+            defer assistant_buf.deinit(self.allocator);
+
+            var tool_accum = ToolCallAccumulator{};
+            defer tool_accum.deinit(self.allocator);
+
+            const result = self.tryRespond(writer, &assistant_buf, &tool_accum) catch |err| switch (err) {
+                error.UpstreamRejected => |e| {
+                    try emitErrorLine(writer, "upstream error", e);
+                    return;
+                },
+                else => return err,
+            };
+
+            switch (result) {
+                .success => {
+                    const tool_calls = try tool_accum.take(self.allocator);
+                    const content_is_null = tool_calls.len != 0 and assistant_buf.items.len == 0;
+                    try self.appendAssistantMessage(assistant_buf.items, tool_calls, content_is_null);
                     snapshot.commit();
                     return;
                 },
@@ -135,14 +312,19 @@ pub const ChatClient = struct {
         retryable,
     };
 
-    fn tryRespond(self: *ChatClient, writer: *Writer, transcript: *std.ArrayListUnmanaged(u8)) !RespondResult {
+    fn tryRespond(
+        self: *ChatClient,
+        writer: *Writer,
+        transcript: *std.ArrayListUnmanaged(u8),
+        tool_accum: *ToolCallAccumulator,
+    ) !RespondResult {
         if (self.config.unix_socket_path.len != 0) {
             return error.UnixSocketsUnavailable;
         }
 
         var payload_buf = std.io.Writer.Allocating.init(self.allocator);
         defer payload_buf.deinit();
-        const payload = try buildPayload(self.config, self.messages.items, &payload_buf);
+        const payload = try self.buildPayload(&payload_buf);
 
         var req = try self.http.request(.POST, self.uri, .{
             .extra_headers = &extraHeaders,
@@ -186,7 +368,7 @@ pub const ChatClient = struct {
         try writer.flush();
 
         var stream_usage: Usage = .{};
-        try self.streamSse(&response, writer, &stream_usage, transcript);
+        try self.streamSse(&response, writer, &stream_usage, transcript, tool_accum);
 
         if (stream_usage.valid) {
             if (self.model_context_limit) |limit| {
@@ -281,6 +463,7 @@ pub const ChatClient = struct {
         writer: *Writer,
         usage: *Usage,
         transcript: *std.ArrayListUnmanaged(u8),
+        tool_accum: *ToolCallAccumulator,
     ) !void {
         var transfer_buf: [2048]u8 = undefined;
         var reader = response.reader(&transfer_buf);
@@ -317,7 +500,7 @@ pub const ChatClient = struct {
                     line_buf.clearRetainingCapacity();
                     if (trimmed.len == 0) {
                         if (event_len > 0) {
-                            done = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript);
+                            done = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript, tool_accum);
                             event_len = 0;
                         }
                         continue;
@@ -343,7 +526,7 @@ pub const ChatClient = struct {
         }
 
         if (!done and event_len > 0) {
-            _ = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript);
+            _ = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript, tool_accum);
         }
     }
 
@@ -354,6 +537,7 @@ pub const ChatClient = struct {
         usage: *Usage,
         chunk_arena: *std.heap.ArenaAllocator,
         transcript: *std.ArrayListUnmanaged(u8),
+        tool_accum: *ToolCallAccumulator,
     ) !bool {
         if (data.len == 0) return false;
         if (std.mem.eql(u8, data, "[DONE]")) return true;
@@ -364,7 +548,7 @@ pub const ChatClient = struct {
 
         const root = parsed.value;
         if (root != .object) return false;
-        try self.emitChoices(root.object, writer, transcript);
+        try self.emitChoices(root.object, writer, transcript, tool_accum);
         try captureUsage(root.object, usage);
 
         return false;
@@ -375,6 +559,7 @@ pub const ChatClient = struct {
         object: std.json.ObjectMap,
         writer: *Writer,
         transcript: *std.ArrayListUnmanaged(u8),
+        tool_accum: *ToolCallAccumulator,
     ) !void {
         const choices_val = object.get("choices") orelse return;
         if (choices_val != .array) return;
@@ -389,6 +574,9 @@ pub const ChatClient = struct {
             }
             if (delta_val != .object) continue;
             const delta_obj = delta_val.object;
+            if (delta_obj.get("tool_calls")) |tool_calls_val| {
+                try self.captureToolCalls(tool_calls_val, tool_accum);
+            }
             if (delta_obj.get("content")) |content_val| {
                 try self.emitContent(content_val, writer, transcript);
             } else if (delta_obj.get("output_text")) |text_val| {
@@ -441,6 +629,56 @@ pub const ChatClient = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    fn captureToolCalls(
+        self: *ChatClient,
+        value: std.json.Value,
+        tool_accum: *ToolCallAccumulator,
+    ) (Allocator.Error || error{StreamFormat})!void {
+        if (value != .array) return;
+        for (value.array.items) |entry| {
+            if (entry != .object) continue;
+            const obj = entry.object;
+
+            const index: usize = if (obj.get("index")) |index_val| blk: {
+                const signed_index: i64 = switch (index_val) {
+                    .integer => |i| i,
+                    else => return error.StreamFormat,
+                };
+                if (signed_index < 0) return error.StreamFormat;
+                const unsigned_index: usize = @intCast(signed_index);
+                break :blk unsigned_index;
+            } else if (tool_accum.calls.items.len == 0) blk: {
+                break :blk 0;
+            } else {
+                return error.StreamFormat;
+            };
+
+            const partial = try tool_accum.acquire(self.allocator, index);
+
+            if (obj.get("id")) |id_val| {
+                if (id_val != .string) return error.StreamFormat;
+                try tool_accum.setId(self.allocator, partial, id_val.string);
+            }
+
+            if (obj.get("type")) |type_val| {
+                if (type_val != .string or !std.mem.eql(u8, type_val.string, "function")) return error.StreamFormat;
+            }
+
+            if (obj.get("function")) |function_val| {
+                if (function_val != .object) return error.StreamFormat;
+                const func_obj = function_val.object;
+                if (func_obj.get("name")) |name_val| {
+                    if (name_val != .string) return error.StreamFormat;
+                    try tool_accum.setName(self.allocator, partial, name_val.string);
+                }
+                if (func_obj.get("arguments")) |args_val| {
+                    if (args_val != .string) return error.StreamFormat;
+                    try tool_accum.appendArguments(self.allocator, partial, args_val.string);
+                }
+            }
         }
     }
 
@@ -506,10 +744,10 @@ pub const ChatClient = struct {
     }
 
     fn buildPayload(
-        config: Config,
-        messages: []const Message,
+        self: *ChatClient,
         buffer: *std.io.Writer.Allocating,
     ) ![]const u8 {
+        const config = self.config;
         buffer.clearRetainingCapacity();
         var jw = std.json.Stringify{
             .writer = &buffer.writer,
@@ -537,6 +775,76 @@ pub const ChatClient = struct {
         try stringifyStep(jw.objectField("temperature"));
         try stringifyStep(jw.write(config.temperature));
 
+        try stringifyStep(jw.objectField("parallel_tool_calls"));
+        try stringifyStep(jw.write(false));
+
+        try stringifyStep(jw.objectField("tools"));
+        try stringifyStep(jw.beginArray());
+        for (Tools.registry) |schema| {
+            try stringifyStep(jw.beginObject());
+            try stringifyStep(jw.objectField("type"));
+            try stringifyStep(jw.write("function"));
+            try stringifyStep(jw.objectField("function"));
+            try stringifyStep(jw.beginObject());
+            try stringifyStep(jw.objectField("name"));
+            try stringifyStep(jw.write(schema.id));
+            try stringifyStep(jw.objectField("description"));
+            try stringifyStep(jw.write(schema.summary));
+            try stringifyStep(jw.objectField("parameters"));
+            try stringifyStep(jw.beginObject());
+            try stringifyStep(jw.objectField("type"));
+            try stringifyStep(jw.write("object"));
+            try stringifyStep(jw.objectField("properties"));
+            try stringifyStep(jw.beginObject());
+            for (schema.parameters) |param| {
+                try stringifyStep(jw.objectField(param.name));
+                try stringifyStep(jw.beginObject());
+                try stringifyStep(jw.objectField("type"));
+                try stringifyStep(jw.write(parameterTypeLabel(param.kind)));
+                if (param.description.len != 0) {
+                    try stringifyStep(jw.objectField("description"));
+                    try stringifyStep(jw.write(param.description));
+                }
+                if (param.minimum) |min| {
+                    try stringifyStep(jw.objectField("minimum"));
+                    try stringifyStep(jw.write(min));
+                }
+                if (param.maximum) |max| {
+                    try stringifyStep(jw.objectField("maximum"));
+                    try stringifyStep(jw.write(max));
+                }
+                switch (param.default_value) {
+                    .none => {},
+                    .string => |value| {
+                        try stringifyStep(jw.objectField("default"));
+                        try stringifyStep(jw.write(value));
+                    },
+                    .integer => |value| {
+                        try stringifyStep(jw.objectField("default"));
+                        try stringifyStep(jw.write(value));
+                    },
+                    .boolean => |value| {
+                        try stringifyStep(jw.objectField("default"));
+                        try stringifyStep(jw.write(value));
+                    },
+                }
+                try stringifyStep(jw.endObject());
+            }
+            try stringifyStep(jw.endObject());
+            try stringifyStep(jw.objectField("required"));
+            try stringifyStep(jw.beginArray());
+            for (schema.parameters) |param| {
+                if (param.required) {
+                    try stringifyStep(jw.write(param.name));
+                }
+            }
+            try stringifyStep(jw.endArray());
+            try stringifyStep(jw.endObject());
+            try stringifyStep(jw.endObject());
+            try stringifyStep(jw.endObject());
+        }
+        try stringifyStep(jw.endArray());
+
         try stringifyStep(jw.objectField("messages"));
         try stringifyStep(jw.beginArray());
         if (config.system_prompt.len != 0) {
@@ -548,12 +856,62 @@ pub const ChatClient = struct {
             try stringifyStep(jw.endObject());
         }
 
-        for (messages) |message| {
+        if (self.tool_context.len != 0) {
+            try stringifyStep(jw.beginObject());
+            try stringifyStep(jw.objectField("role"));
+            try stringifyStep(jw.write("system"));
+            try stringifyStep(jw.objectField("content"));
+            try stringifyStep(jw.write(self.tool_context));
+            try stringifyStep(jw.endObject());
+        }
+
+        for (self.messages.items) |message| {
             try stringifyStep(jw.beginObject());
             try stringifyStep(jw.objectField("role"));
             try stringifyStep(jw.write(roleName(message.role)));
-            try stringifyStep(jw.objectField("content"));
-            try stringifyStep(jw.write(message.content));
+            switch (message.role) {
+                .tool => {
+                    if (message.tool_call_id.len != 0) {
+                        try stringifyStep(jw.objectField("tool_call_id"));
+                        try stringifyStep(jw.write(message.tool_call_id));
+                    }
+                    if (message.tool_name.len != 0) {
+                        try stringifyStep(jw.objectField("name"));
+                        try stringifyStep(jw.write(message.tool_name));
+                    }
+                    try stringifyStep(jw.objectField("content"));
+                    try stringifyStep(jw.write(message.content));
+                },
+                else => {
+                    try stringifyStep(jw.objectField("content"));
+                    if (message.content_is_null) {
+                        try stringifyStep(jw.write(@as(?bool, null)));
+                    } else {
+                        try stringifyStep(jw.write(message.content));
+                    }
+
+                    if (message.tool_calls.len != 0) {
+                        try stringifyStep(jw.objectField("tool_calls"));
+                        try stringifyStep(jw.beginArray());
+                        for (message.tool_calls) |call| {
+                            try stringifyStep(jw.beginObject());
+                            try stringifyStep(jw.objectField("id"));
+                            try stringifyStep(jw.write(call.id));
+                            try stringifyStep(jw.objectField("type"));
+                            try stringifyStep(jw.write("function"));
+                            try stringifyStep(jw.objectField("function"));
+                            try stringifyStep(jw.beginObject());
+                            try stringifyStep(jw.objectField("name"));
+                            try stringifyStep(jw.write(call.name));
+                            try stringifyStep(jw.objectField("arguments"));
+                            try stringifyStep(jw.write(call.arguments_json));
+                            try stringifyStep(jw.endObject());
+                            try stringifyStep(jw.endObject());
+                        }
+                        try stringifyStep(jw.endArray());
+                    }
+                },
+            }
             try stringifyStep(jw.endObject());
         }
 
@@ -573,27 +931,103 @@ pub const ChatClient = struct {
         return switch (role) {
             .user => "user",
             .assistant => "assistant",
+            .tool => "tool",
         };
     }
 
-    fn appendMessage(self: *ChatClient, role: Role, content: []const u8) !void {
-        const copy = try self.allocator.alloc(u8, content.len);
-        errdefer self.allocator.free(copy);
-        if (content.len != 0) {
-            @memcpy(copy, content);
+    pub fn markLastAssistantToolHandled(self: *ChatClient) void {
+        var idx = self.messages.items.len;
+        while (idx != 0) {
+            idx -= 1;
+            var message = &self.messages.items[idx];
+            if (message.role != .assistant) continue;
+            if (message.tool_calls.len == 0) return;
+            if (message.processed_tool_calls < message.tool_calls.len) {
+                message.processed_tool_calls += 1;
+            }
+            return;
         }
-        try self.messages.append(self.allocator, .{
-            .role = role,
-            .content = copy,
-        });
+    }
+
+    fn appendUserMessage(self: *ChatClient, content: []const u8) !void {
+        var message = Message{
+            .role = .user,
+        };
+        if (content.len != 0) {
+            message.content = try dupSlice(self.allocator, content);
+            errdefer self.allocator.free(message.content);
+        }
+        try self.messages.append(self.allocator, message);
+    }
+
+    fn appendAssistantMessage(
+        self: *ChatClient,
+        content: []const u8,
+        tool_calls: []ToolCall,
+        content_is_null: bool,
+    ) !void {
+        var message = Message{
+            .role = .assistant,
+            .content_is_null = content_is_null,
+            .tool_calls = tool_calls,
+            .processed_tool_calls = 0,
+        };
+
+        if (content.len != 0) {
+            message.content = try dupSlice(self.allocator, content);
+            errdefer self.allocator.free(message.content);
+        }
+
+        if (tool_calls.len != 0) {
+            errdefer {
+                freeToolCalls(self.allocator, tool_calls);
+                self.allocator.free(tool_calls);
+            }
+        }
+
+        try self.messages.append(self.allocator, message);
+    }
+
+    pub fn appendToolMessage(
+        self: *ChatClient,
+        call_id: []const u8,
+        tool_name: []const u8,
+        content: []u8,
+    ) !void {
+        var message = Message{
+            .role = .tool,
+            .content = content,
+        };
+        errdefer if (message.content.len != 0) self.allocator.free(message.content);
+
+        if (call_id.len != 0) {
+            message.tool_call_id = try dupSlice(self.allocator, call_id);
+            errdefer self.allocator.free(message.tool_call_id);
+        }
+
+        if (tool_name.len != 0) {
+            message.tool_name = try dupSlice(self.allocator, tool_name);
+            errdefer self.allocator.free(message.tool_name);
+        }
+
+        try self.messages.append(self.allocator, message);
+    }
+
+    pub fn setToolContext(self: *ChatClient, context: []const u8) !void {
+        if (self.tool_context.len != 0) {
+            self.allocator.free(self.tool_context);
+            self.tool_context = &.{};
+        }
+        if (context.len == 0) return;
+        self.tool_context = try dupSlice(self.allocator, context);
     }
 
     fn truncateMessages(self: *ChatClient, new_len: usize) void {
         var len = self.messages.items.len;
         while (len > new_len) {
             len -= 1;
-            const message = self.messages.items[len];
-            if (message.content.len != 0) self.allocator.free(message.content);
+            var message = &self.messages.items[len];
+            message.deinit(self.allocator);
         }
         self.messages.items.len = new_len;
     }
@@ -602,8 +1036,8 @@ pub const ChatClient = struct {
         var len = self.messages.items.len;
         while (len > 0) {
             len -= 1;
-            const message = self.messages.items[len];
-            if (message.content.len != 0) self.allocator.free(message.content);
+            var message = &self.messages.items[len];
+            message.deinit(self.allocator);
         }
         self.messages.items.len = 0;
     }
@@ -661,6 +1095,28 @@ pub const ChatClient = struct {
         @memcpy(header[0..prefix.len], prefix);
         @memcpy(header[prefix.len..], key);
         return header;
+    }
+
+    fn dupSlice(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
+        const copy = try allocator.alloc(u8, src.len);
+        if (src.len != 0) @memcpy(copy, src);
+        return copy;
+    }
+
+    fn freeToolCalls(allocator: Allocator, calls: []ToolCall) void {
+        for (calls) |call| {
+            if (call.id.len != 0) allocator.free(call.id);
+            if (call.name.len != 0) allocator.free(call.name);
+            if (call.arguments_json.len != 0) allocator.free(call.arguments_json);
+        }
+    }
+
+    fn parameterTypeLabel(kind: Tools.ParameterKind) []const u8 {
+        return switch (kind) {
+            .string => "string",
+            .integer => "integer",
+            .boolean => "boolean",
+        };
     }
 
     fn emitErrorLine(writer: *Writer, message: []const u8, err: ?anyerror) !void {
