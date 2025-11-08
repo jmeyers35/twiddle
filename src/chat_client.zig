@@ -37,6 +37,14 @@ pub const ChatClient = struct {
     auth_header: []u8,
     last_rtt_ns: u64 = 2 * std.time.ns_per_s,
     model_context_limit: ?u32 = null,
+    messages: std.ArrayListUnmanaged(Message) = .empty,
+
+    const Role = enum { user, assistant };
+
+    const Message = struct {
+        role: Role,
+        content: []u8,
+    };
 
     const min_timeout_ns: u64 = 750 * std.time.ns_per_ms;
     const max_timeout_ns: u64 = 20 * std.time.ns_per_s;
@@ -55,6 +63,7 @@ pub const ChatClient = struct {
             .uri_storage = uri_storage,
             .config = config,
             .auth_header = &.{},
+            .messages = .empty,
         };
 
         client.uri = try std.Uri.parse(client.uri_storage);
@@ -67,6 +76,8 @@ pub const ChatClient = struct {
     }
 
     pub fn deinit(self: *ChatClient) void {
+        self.clearMessages();
+        self.messages.deinit(self.allocator);
         self.http.deinit();
         if (self.uri_storage.len != 0) {
             self.allocator.free(self.uri_storage);
@@ -81,9 +92,17 @@ pub const ChatClient = struct {
     pub fn respond(self: *ChatClient, user_input: []const u8, writer: *Writer) !void {
         if (user_input.len == 0) return;
 
+        var snapshot = MessageSnapshot.init(self);
+        defer snapshot.cancel();
+
+        try self.appendMessage(.user, user_input);
+
         var attempts: u8 = 0;
         while (true) : (attempts += 1) {
-            const result = self.tryRespond(user_input, writer) catch |err| switch (err) {
+            var assistant_buf = std.ArrayListUnmanaged(u8){};
+            defer assistant_buf.deinit(self.allocator);
+
+            const result = self.tryRespond(writer, &assistant_buf) catch |err| switch (err) {
                 error.UpstreamRejected => |e| {
                     try emitErrorLine(writer, "upstream error", e);
                     return;
@@ -92,7 +111,11 @@ pub const ChatClient = struct {
             };
 
             switch (result) {
-                .success => return,
+                .success => {
+                    try self.appendMessage(.assistant, assistant_buf.items);
+                    snapshot.commit();
+                    return;
+                },
                 .retryable => {
                     if (attempts >= 1) {
                         try emitErrorLine(writer, "upstream temporarily unavailable, retry limit hit", null);
@@ -111,13 +134,14 @@ pub const ChatClient = struct {
         retryable,
     };
 
-    fn tryRespond(self: *ChatClient, user_input: []const u8, writer: *Writer) !RespondResult {
+    fn tryRespond(self: *ChatClient, writer: *Writer, transcript: *std.ArrayListUnmanaged(u8)) !RespondResult {
         if (self.config.unix_socket_path.len != 0) {
             return error.UnixSocketsUnavailable;
         }
 
-        var payload_storage: [96 * 1024]u8 = undefined;
-        const payload = try buildPayload(self.config, user_input, &payload_storage);
+        var payload_buf = std.io.Writer.Allocating.init(self.allocator);
+        defer payload_buf.deinit();
+        const payload = try buildPayload(self.config, self.messages.items, &payload_buf);
 
         var req = try self.http.request(.POST, self.uri, .{
             .extra_headers = &extraHeaders,
@@ -161,7 +185,7 @@ pub const ChatClient = struct {
         try writer.flush();
 
         var stream_usage: Usage = .{};
-        try self.streamSse(&response, writer, &stream_usage);
+        try self.streamSse(&response, writer, &stream_usage, transcript);
 
         if (stream_usage.valid) {
             if (self.model_context_limit) |limit| {
@@ -255,6 +279,7 @@ pub const ChatClient = struct {
         response: *std.http.Client.Response,
         writer: *Writer,
         usage: *Usage,
+        transcript: *std.ArrayListUnmanaged(u8),
     ) !void {
         var transfer_buf: [2048]u8 = undefined;
         var reader = response.reader(&transfer_buf);
@@ -291,7 +316,7 @@ pub const ChatClient = struct {
                     line_buf.clearRetainingCapacity();
                     if (trimmed.len == 0) {
                         if (event_len > 0) {
-                            done = try handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena);
+                            done = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript);
                             event_len = 0;
                         }
                         continue;
@@ -317,15 +342,17 @@ pub const ChatClient = struct {
         }
 
         if (!done and event_len > 0) {
-            _ = try handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena);
+            _ = try self.handleEvent(event_buf[0..event_len], writer, usage, &chunk_arena, transcript);
         }
     }
 
     fn handleEvent(
+        self: *ChatClient,
         data: []const u8,
         writer: *Writer,
         usage: *Usage,
         chunk_arena: *std.heap.ArenaAllocator,
+        transcript: *std.ArrayListUnmanaged(u8),
     ) !bool {
         if (data.len == 0) return false;
         if (std.mem.eql(u8, data, "[DONE]")) return true;
@@ -336,13 +363,18 @@ pub const ChatClient = struct {
 
         const root = parsed.value;
         if (root != .object) return false;
-        try emitChoices(root.object, writer);
+        try self.emitChoices(root.object, writer, transcript);
         try captureUsage(root.object, usage);
 
         return false;
     }
 
-    fn emitChoices(object: std.json.ObjectMap, writer: *Writer) !void {
+    fn emitChoices(
+        self: *ChatClient,
+        object: std.json.ObjectMap,
+        writer: *Writer,
+        transcript: *std.ArrayListUnmanaged(u8),
+    ) !void {
         const choices_val = object.get("choices") orelse return;
         if (choices_val != .array) return;
         for (choices_val.array.items) |choice| {
@@ -350,39 +382,49 @@ pub const ChatClient = struct {
             const delta_val = choice.object.get("delta") orelse continue;
             if (delta_val == .string) {
                 try writer.writeAll(delta_val.string);
+                try self.captureTranscript(transcript, delta_val.string);
                 try writer.flush();
                 continue;
             }
             if (delta_val != .object) continue;
             const delta_obj = delta_val.object;
             if (delta_obj.get("content")) |content_val| {
-                try emitContent(content_val, writer);
+                try self.emitContent(content_val, writer, transcript);
             } else if (delta_obj.get("output_text")) |text_val| {
                 if (text_val == .string) {
                     try writer.writeAll(text_val.string);
+                    try self.captureTranscript(transcript, text_val.string);
                     try writer.flush();
                 }
             }
         }
     }
 
-    fn emitContent(value: std.json.Value, writer: *Writer) !void {
+    fn emitContent(
+        self: *ChatClient,
+        value: std.json.Value,
+        writer: *Writer,
+        transcript: *std.ArrayListUnmanaged(u8),
+    ) !void {
         switch (value) {
             .string => |str| {
                 try writer.writeAll(str);
+                try self.captureTranscript(transcript, str);
                 try writer.flush();
             },
             .array => |arr| {
                 for (arr.items) |item| {
                     if (item == .string) {
                         try writer.writeAll(item.string);
+                        try self.captureTranscript(transcript, item.string);
                     } else if (item == .object) {
                         if (item.object.get("text")) |text_val| {
                             if (text_val == .string) {
                                 try writer.writeAll(text_val.string);
+                                try self.captureTranscript(transcript, text_val.string);
                             }
                         } else if (item.object.get("content")) |content| {
-                            try emitContent(content, writer);
+                            try self.emitContent(content, writer, transcript);
                         }
                     }
                 }
@@ -392,6 +434,7 @@ pub const ChatClient = struct {
                 if (obj.get("text")) |text_val| {
                     if (text_val == .string) {
                         try writer.writeAll(text_val.string);
+                        try self.captureTranscript(transcript, text_val.string);
                         try writer.flush();
                     }
                 }
@@ -432,10 +475,14 @@ pub const ChatClient = struct {
         return line;
     }
 
-    fn buildPayload(config: Config, user_input: []const u8, storage: []u8) ![]u8 {
-        var buffer_writer = std.io.Writer.fixed(storage);
+    fn buildPayload(
+        config: Config,
+        messages: []const Message,
+        buffer: *std.io.Writer.Allocating,
+    ) ![]const u8 {
+        buffer.clearRetainingCapacity();
         var jw = std.json.Stringify{
-            .writer = &buffer_writer,
+            .writer = &buffer.writer,
             .options = .{ .whitespace = .minified },
         };
 
@@ -471,17 +518,19 @@ pub const ChatClient = struct {
             try stringifyStep(jw.endObject());
         }
 
-        try stringifyStep(jw.beginObject());
-        try stringifyStep(jw.objectField("role"));
-        try stringifyStep(jw.write("user"));
-        try stringifyStep(jw.objectField("content"));
-        try stringifyStep(jw.write(user_input));
-        try stringifyStep(jw.endObject());
+        for (messages) |message| {
+            try stringifyStep(jw.beginObject());
+            try stringifyStep(jw.objectField("role"));
+            try stringifyStep(jw.write(roleName(message.role)));
+            try stringifyStep(jw.objectField("content"));
+            try stringifyStep(jw.write(message.content));
+            try stringifyStep(jw.endObject());
+        }
 
         try stringifyStep(jw.endArray());
         try stringifyStep(jw.endObject());
 
-        return buffer_writer.buffer[0..buffer_writer.end];
+        return buffer.written();
     }
 
     inline fn stringifyStep(res: std.json.Stringify.Error!void) error{PayloadTooLarge}!void {
@@ -489,6 +538,73 @@ pub const ChatClient = struct {
             error.WriteFailed => return error.PayloadTooLarge,
         };
     }
+
+    fn roleName(role: Role) []const u8 {
+        return switch (role) {
+            .user => "user",
+            .assistant => "assistant",
+        };
+    }
+
+    fn appendMessage(self: *ChatClient, role: Role, content: []const u8) !void {
+        const copy = try self.allocator.alloc(u8, content.len);
+        errdefer self.allocator.free(copy);
+        if (content.len != 0) {
+            @memcpy(copy, content);
+        }
+        try self.messages.append(self.allocator, .{
+            .role = role,
+            .content = copy,
+        });
+    }
+
+    fn truncateMessages(self: *ChatClient, new_len: usize) void {
+        var len = self.messages.items.len;
+        while (len > new_len) {
+            len -= 1;
+            const message = self.messages.items[len];
+            if (message.content.len != 0) self.allocator.free(message.content);
+        }
+        self.messages.items.len = new_len;
+    }
+
+    fn clearMessages(self: *ChatClient) void {
+        var len = self.messages.items.len;
+        while (len > 0) {
+            len -= 1;
+            const message = self.messages.items[len];
+            if (message.content.len != 0) self.allocator.free(message.content);
+        }
+        self.messages.items.len = 0;
+    }
+
+    fn captureTranscript(self: *ChatClient, transcript: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+        if (text.len == 0) return;
+        try transcript.appendSlice(self.allocator, text);
+    }
+
+    const MessageSnapshot = struct {
+        client: *ChatClient,
+        len: usize,
+        committed: bool = false,
+
+        fn init(client: *ChatClient) MessageSnapshot {
+            return .{
+                .client = client,
+                .len = client.messages.items.len,
+            };
+        }
+
+        fn commit(self: *MessageSnapshot) void {
+            self.committed = true;
+        }
+
+        fn cancel(self: *MessageSnapshot) void {
+            if (!self.committed) {
+                self.client.truncateMessages(self.len);
+            }
+        }
+    };
 
     fn buildAuthHeader(allocator: Allocator, config: Config) ![]u8 {
         if (config.api_key) |key| {
