@@ -1,0 +1,9 @@
+[tools]
+zig = "0.15.2"
+
+[tasks.check]
+description = "Build twiddle and run zlint"
+run = [
+  "zig build",
+  "zlint"
+]

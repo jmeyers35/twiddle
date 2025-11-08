@@ -1,12 +1,18 @@
 # twiddle - the most efficient coding agent in the universe
 
 ## Goals
-- Zero dependencies (minus stdlib)
+- Minimal dependencies
 - Hyper-efficient, down to every bit
 - Unreasonably effective
 
 ## Evaluating Performance
 - We'll use terminalbench to evaluate Agent effectiveness
+
+## Development
+- Trust the repo config once via `mise trust` (required before tasks run).
+- Install the pinned Zig toolchain via `mise install` (reads `.mise.toml`).
+- Install `zlint` from https://github.com/DonIsaac/zlint (needed for linting).
+- Run `mise run check` to build the project and execute `zlint` in one shot.
 
 ## Configuration
 Create `~/.twiddle/twiddle.toml` to override the default OpenRouter settings or to store your API key. The current schema is intentionally tiny:

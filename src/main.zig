@@ -1,10 +1,14 @@
 const std = @import("std");
 const ChatClient = @import("chat_client.zig").ChatClient;
 const Config = @import("config.zig");
+const spinner_mod = @import("spinner.zig");
+const Spinner = spinner_mod.Spinner;
+const SpinnerWriter = spinner_mod.SpinnerWriter;
 
 pub fn main() !void {
     const stdin = std.fs.File.stdin();
     const stdout = std.fs.File.stdout();
+    const stdout_is_tty = stdout.isTty();
 
     var stdin_buffer: [64 * 1024]u8 = undefined;
     var stdout_buffer: [4 * 1024]u8 = undefined;
@@ -57,6 +61,7 @@ pub fn main() !void {
     defer chat_client.deinit();
 
     const prompt = "twiddle> ";
+    const wait_message = "twiddling...";
 
     while (true) {
         try output_stream.writeAll(prompt);
@@ -81,13 +86,32 @@ pub fn main() !void {
         if (std.mem.eql(u8, trimmed, "exit")) break;
 
         try output_stream.writeAll("\n");
-        chat_client.respond(trimmed, output_stream) catch |err| {
+
+        var spinner = Spinner.init(gpa.allocator(), output_stream, wait_message);
+        if (stdout_is_tty) {
+            spinner.start() catch |err| {
+                std.log.warn("spinner start failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        var response_writer: *std.Io.Writer = output_stream;
+        // SAFETY: spinner_writer is conditionally initialized before any use.
+        var spinner_writer: SpinnerWriter = undefined;
+        if (spinner.isActive()) {
+            spinner_writer.init(output_stream, &spinner);
+            response_writer = spinner_writer.writer();
+        }
+
+        chat_client.respond(trimmed, response_writer) catch |err| {
+            spinner.stop();
             try output_stream.writeAll("chat error: ");
             try output_stream.writeAll(@errorName(err));
             try output_stream.writeAll("\n\n");
             try output_stream.flush();
             continue;
         };
+        spinner.stop();
+
         try output_stream.writeAll("\n");
         try output_stream.flush();
     }
