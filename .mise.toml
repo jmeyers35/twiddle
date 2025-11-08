@@ -5,6 +5,7 @@ zig = "0.15.2"
 description = "Build twiddle and run zlint"
 run = [
   "zig build",
+  "zig build test",
   "zlint"
 ]
 

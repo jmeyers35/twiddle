@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_context = @import("model_context.zig");
+const testing = std.testing;
 
 pub const ChatClient = struct {
     const Allocator = std.mem.Allocator;
@@ -189,8 +190,8 @@ pub const ChatClient = struct {
 
         if (stream_usage.valid) {
             if (self.model_context_limit) |limit| {
-                if (contextRemainingPercent(limit, stream_usage.total_tokens)) |percent| {
-                    try emitContextSummary(writer, percent);
+                if (contextUsage(limit, stream_usage.total_tokens)) |usage_info| {
+                    try emitContextSummary(writer, usage_info);
                     return RespondResult.success;
                 }
             }
@@ -250,23 +251,23 @@ pub const ChatClient = struct {
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
     }
 
-    fn contextRemainingPercent(limit: u32, total_tokens: i64) ?u8 {
-        if (limit == 0 or total_tokens < 0) return null;
-        const limit_u64: u64 = limit;
-        const used_u64: u64 = @intCast(total_tokens);
-        if (used_u64 >= limit_u64) return 0;
-        const used_percent = (used_u64 * 100) / limit_u64;
-        if (used_percent >= 100) return 0;
-        const remaining = 100 - used_percent;
-        return @intCast(remaining);
+    fn emitContextSummary(writer: anytype, info: ContextUsage) !void {
+        try writeContextSummary(writer, info, colorEnabled());
     }
 
-    fn emitContextSummary(writer: *Writer, percent: u8) !void {
-        const use_color = colorEnabled();
+    fn writeContextSummary(writer: anytype, info: ContextUsage, use_color: bool) !void {
         try writer.writeAll("\n\n");
         if (use_color) try writer.writeAll("\x1b[2m\x1b[36m");
         try writer.writeAll("[context] ");
-        try writer.print("{d}% context left", .{percent});
+        const whole = info.remaining_hundredths / 100;
+        const fractional = info.remaining_hundredths % 100;
+        var frac_buf: [2]u8 = undefined;
+        frac_buf[0] = std.fmt.digitToChar(@intCast(fractional / 10), .lower);
+        frac_buf[1] = std.fmt.digitToChar(@intCast(fractional % 10), .lower);
+        try writer.print(
+            "{d}.{s}% context left ({d}/{d} tokens used)",
+            .{ whole, frac_buf[0..], info.used_tokens, info.limit_tokens },
+        );
         if (use_color) try writer.writeAll("\x1b[0m");
         try writer.writeAll("\n");
     }
@@ -449,6 +450,35 @@ pub const ChatClient = struct {
         total_tokens: i64 = 0,
         valid: bool = false,
     };
+
+    const ContextUsage = struct {
+        remaining_hundredths: u16,
+        used_tokens: u64,
+        limit_tokens: u32,
+    };
+
+    fn contextUsage(limit: u32, total_tokens: i64) ?ContextUsage {
+        if (limit == 0 or total_tokens < 0) return null;
+        const limit_u64: u64 = limit;
+        const used_u64: u64 = @intCast(total_tokens);
+        if (used_u64 >= limit_u64) {
+            return ContextUsage{
+                .remaining_hundredths = 0,
+                .used_tokens = used_u64,
+                .limit_tokens = limit,
+            };
+        }
+
+        const remaining = limit_u64 - used_u64;
+        const scaled: u64 = (remaining * 10000) / limit_u64;
+        const hundredths: u16 = @intCast(scaled);
+
+        return ContextUsage{
+            .remaining_hundredths = hundredths,
+            .used_tokens = used_u64,
+            .limit_tokens = limit,
+        };
+    }
 
     fn captureUsage(object: std.json.ObjectMap, usage: *Usage) !void {
         const usage_val = object.get("usage") orelse return;
@@ -661,3 +691,30 @@ pub const ChatClient = struct {
         .{ .name = "Connection", .value = "keep-alive" },
     };
 };
+
+test "contextUsage reports remaining percentage and tokens" {
+    const usage = ChatClient.contextUsage(4000, 1000) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u16, 7500), usage.remaining_hundredths);
+    try testing.expectEqual(@as(u64, 1000), usage.used_tokens);
+    try testing.expectEqual(@as(u32, 4000), usage.limit_tokens);
+
+    const saturated = ChatClient.contextUsage(2000, 3000) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u16, 0), saturated.remaining_hundredths);
+    try testing.expectEqual(@as(u64, 3000), saturated.used_tokens);
+    try testing.expectEqual(@as(u32, 2000), saturated.limit_tokens);
+}
+
+test "context summary formatting prints percentage and tokens" {
+    var buffer: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    var writer = stream.writer();
+    const info = ChatClient.ContextUsage{
+        .remaining_hundredths = 1234,
+        .used_tokens = 876,
+        .limit_tokens = 7000,
+    };
+    try ChatClient.writeContextSummary(&writer, info, false);
+    const expected =
+        "\n\n[context] 12.34% context left (876/7000 tokens used)\n";
+    try testing.expectEqualStrings(expected, stream.getWritten());
+}
