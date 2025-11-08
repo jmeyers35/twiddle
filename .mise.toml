@@ -7,3 +7,16 @@ run = [
   "zig build",
   "zlint"
 ]
+
+[tasks.fetch-model-context]
+description = "Download OpenRouter model context sizes"
+run = [
+  "./hack/fetch-model-context.sh"
+]
+
+[tasks.generate]
+description = "Refresh model context data (download + regenerate table)"
+run = [
+  "./hack/fetch-model-context.sh",
+  "zig run hack/generate_model_context_table.zig -- --input config/model_context.json --output src/model_context_data.zig"
+]

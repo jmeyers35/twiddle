@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_context = @import("model_context.zig");
 
 pub const ChatClient = struct {
     const Allocator = std.mem.Allocator;
@@ -35,6 +36,7 @@ pub const ChatClient = struct {
     config: Config,
     auth_header: []u8,
     last_rtt_ns: u64 = 2 * std.time.ns_per_s,
+    model_context_limit: ?u32 = null,
 
     const min_timeout_ns: u64 = 750 * std.time.ns_per_ms;
     const max_timeout_ns: u64 = 20 * std.time.ns_per_s;
@@ -60,6 +62,7 @@ pub const ChatClient = struct {
         errdefer client.http.deinit();
 
         client.auth_header = try buildAuthHeader(allocator, config);
+        client.model_context_limit = model_context.lookup(allocator, config.model);
         return client;
     }
 
@@ -161,16 +164,15 @@ pub const ChatClient = struct {
         try self.streamSse(&response, writer, &stream_usage);
 
         if (stream_usage.valid) {
-            try writer.writeAll("\n[tokens prompt:");
-            try writer.print(" {d}", .{stream_usage.prompt_tokens});
-            try writer.writeAll(" completion:");
-            try writer.print(" {d}", .{stream_usage.completion_tokens});
-            try writer.writeAll(" total:");
-            try writer.print(" {d}", .{stream_usage.total_tokens});
-            try writer.writeAll("]\n");
-        } else {
-            try writer.writeAll("\n");
+            if (self.model_context_limit) |limit| {
+                if (contextRemainingPercent(limit, stream_usage.total_tokens)) |percent| {
+                    try emitContextSummary(writer, percent);
+                    return RespondResult.success;
+                }
+            }
         }
+
+        try writer.writeAll("\n");
 
         return RespondResult.success;
     }
@@ -224,6 +226,30 @@ pub const ChatClient = struct {
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
     }
 
+    fn contextRemainingPercent(limit: u32, total_tokens: i64) ?u8 {
+        if (limit == 0 or total_tokens < 0) return null;
+        const limit_u64: u64 = limit;
+        const used_u64: u64 = @intCast(total_tokens);
+        if (used_u64 >= limit_u64) return 0;
+        const used_percent = (used_u64 * 100) / limit_u64;
+        if (used_percent >= 100) return 0;
+        const remaining = 100 - used_percent;
+        return @intCast(remaining);
+    }
+
+    fn emitContextSummary(writer: *Writer, percent: u8) !void {
+        const use_color = colorEnabled();
+        try writer.writeAll("\n\n");
+        if (use_color) try writer.writeAll("\x1b[2m\x1b[36m");
+        try writer.writeAll("[context] ");
+        try writer.print("{d}% context left", .{percent});
+        if (use_color) try writer.writeAll("\x1b[0m");
+        try writer.writeAll("\n");
+    }
+
+    fn colorEnabled() bool {
+        return !std.process.hasEnvVarConstant("NO_COLOR");
+    }
     fn streamSse(
         self: *ChatClient,
         response: *std.http.Client.Response,
