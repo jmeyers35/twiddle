@@ -29,7 +29,7 @@ pub const ChatClient = struct {
         max_completion_tokens: ?u32 = null,
         unix_socket_path: []const u8 = "",
         system_prompt: []const u8 =
-            "You are twiddle, an extremely efficient coding agent. " ++ "Answer with concise, accurate steps and code when needed.",
+            "You are twiddle, an extremely efficient coding agent. " ++ "Answer with concise, accurate steps and code when needed. " ++ "You start in read-only mode; when you need to modify files, ALWAYS call the apply_patch tool with workspace-relative paths (or paths relative to the workdir you specify). " ++ "The CLI will request any needed workspace-write approvals after the tool call. " ++ "Never ask the user for permission to edit files or claim you cannot edit—read the current file for context and invoke apply_patch again. " ++ "Always re-read the target file immediately before building a patch so your context matches the current contents, and include that fresh context in your hunks. " ++ "If apply_patch fails because the context does not match, re-read the file and produce a corrected patch rather than retrying blindly. " ++ "Whenever possible, bundle the entire edit into a single apply_patch invocation with relative paths.",
     };
 
     pub const Error = std.http.Client.RequestError || std.http.Client.Request.SendError || std.http.Client.Request.ReceiveHeadError || std.net.Stream.ReadError || std.mem.Allocator.Error || error{

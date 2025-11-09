@@ -6,8 +6,14 @@ const Spinner = @import("../spinner.zig").Spinner;
 const SpinnerWriter = @import("../spinner.zig").SpinnerWriter;
 const ToolExecutor = @import("../tool_executor.zig").ToolExecutor;
 const Tools = @import("../tools.zig");
+const ManagedArrayList = std.array_list.Managed;
 const ascii = std.ascii;
 const testing = std.testing;
+
+const DiffEntry = struct {
+    path: []const u8,
+    kind: []const u8,
+};
 
 /// Represents a single CLI session lifetime (the period between launching and exiting twiddle).
 /// Multiple prompt turns may be handled by the same Session, and approvals persist until the process exits.
@@ -174,6 +180,9 @@ pub const Session = struct {
                     };
                     defer parsed.deinit();
                     emitToolSuccessSummary(self.output_stream, request.tool_id, payload, parsed.value);
+                    if (std.mem.eql(u8, request.tool_id, Tools.ApplyPatch.id)) {
+                        emitApplyPatchDetails(self, parsed.value);
+                    }
                     const copy = try self.allocator.alloc(u8, payload.len);
                     if (payload.len != 0) @memcpy(copy, payload);
                     break :blk copy;
@@ -354,6 +363,9 @@ fn emitFriendlyToolSummary(writer: *std.Io.Writer, tool_id: []const u8, value: s
     if (std.mem.eql(u8, tool_id, Tools.Search.id)) {
         return Tools.Search.emitSummary(writer, value);
     }
+    if (std.mem.eql(u8, tool_id, Tools.ApplyPatch.id)) {
+        return Tools.ApplyPatch.emitSummary(writer, value);
+    }
     return false;
 }
 
@@ -384,5 +396,157 @@ fn toolErrorMessage(err: anyerror) []const u8 {
         error.PermissionDenied => "tool permission denied",
         error.ToolUnavailable => "tool unavailable",
         else => "tool executor error",
+    };
+}
+
+fn emitApplyPatchDetails(self: *Session, value: std.json.Value) void {
+    if (value != .object) return;
+    const obj = value.object;
+    const changes_val = obj.get("changes") orelse return;
+    if (changes_val != .array) return;
+
+    var add_count: usize = 0;
+    var delete_count: usize = 0;
+    var update_count: usize = 0;
+
+    var entries = ManagedArrayList(DiffEntry).init(self.allocator);
+    defer entries.deinit();
+
+    for (changes_val.array.items) |item| {
+        if (item != .object) continue;
+        const change_obj = item.object;
+        const path_val = change_obj.get("path") orelse continue;
+        const kind_val = change_obj.get("kind") orelse continue;
+        const workspace_val = change_obj.get("workspace_path") orelse null;
+        if (path_val != .string or kind_val != .string) continue;
+
+        if (std.mem.eql(u8, kind_val.string, "add")) {
+            add_count += 1;
+        } else if (std.mem.eql(u8, kind_val.string, "delete")) {
+            delete_count += 1;
+        } else if (std.mem.eql(u8, kind_val.string, "update")) {
+            update_count += 1;
+        }
+
+        const diff_path = if (workspace_val) |workspace_path_val|
+            if (workspace_path_val == .string) workspace_path_val.string else path_val.string
+        else
+            path_val.string;
+
+        entries.append(.{
+            .path = diff_path,
+            .kind = kind_val.string,
+        }) catch return;
+    }
+
+    const total = add_count + delete_count + update_count;
+    if (total == 0) return;
+
+    var buffer: [160]u8 = undefined;
+    const summary = std.fmt.bufPrint(
+        &buffer,
+        "apply_patch modified {d} file(s): +{d} / -{d} / Δ{d}\n",
+        .{ total, add_count, delete_count, update_count },
+    ) catch buffer[0..0];
+    if (summary.len != 0) {
+        _ = safeWrite(self.output_stream, summary);
+    }
+    runGitDiff(self, entries.items);
+}
+
+fn runGitDiff(self: *Session, entries: []const DiffEntry) void {
+    if (entries.len == 0) return;
+    var argv = ManagedArrayList([]const u8).init(self.allocator);
+    defer argv.deinit();
+
+    argv.appendSlice(&.{ "git", "--no-pager", "diff", "--color" }) catch return;
+    argv.append("--") catch return;
+    for (entries) |entry| {
+        argv.append(entry.path) catch return;
+    }
+
+    const run_result = runGitCommand(self, argv.items) catch {
+        _ = safeWrite(self.output_stream, "git diff failed (command unavailable)\n");
+        safeFlush(self.output_stream);
+        return;
+    };
+    defer {
+        self.allocator.free(run_result.stdout);
+        self.allocator.free(run_result.stderr);
+    }
+
+    var any_output = false;
+    const success = switch (run_result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (run_result.stdout.len != 0) {
+        _ = safeWrite(self.output_stream, run_result.stdout);
+        if (run_result.stdout[run_result.stdout.len - 1] != '\n') {
+            _ = safeWrite(self.output_stream, "\n");
+        }
+        any_output = true;
+    }
+    if (run_result.stderr.len != 0) {
+        _ = safeWrite(self.output_stream, run_result.stderr);
+        if (run_result.stderr[run_result.stderr.len - 1] != '\n') {
+            _ = safeWrite(self.output_stream, "\n");
+        }
+    }
+
+    const dev_null = if (std.fs.path.sep == '\\') "NUL" else "/dev/null";
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.kind, "add")) continue;
+        if (pathTracked(self, entry.path)) continue;
+        const fallback_args = [_][]const u8{ "git", "--no-pager", "diff", "--color", "--no-index", "--", dev_null, entry.path };
+        const fallback = runGitCommand(self, &fallback_args) catch continue;
+        defer {
+            self.allocator.free(fallback.stdout);
+            self.allocator.free(fallback.stderr);
+        }
+
+        if (fallback.stdout.len != 0) {
+            _ = safeWrite(self.output_stream, fallback.stdout);
+            if (fallback.stdout[fallback.stdout.len - 1] != '\n') {
+                _ = safeWrite(self.output_stream, "\n");
+            }
+            any_output = true;
+        }
+        if (fallback.stderr.len != 0) {
+            _ = safeWrite(self.output_stream, fallback.stderr);
+            if (fallback.stderr[fallback.stderr.len - 1] != '\n') {
+                _ = safeWrite(self.output_stream, "\n");
+            }
+        }
+    }
+
+    if (!any_output and !success) {
+        _ = safeWrite(self.output_stream, "git diff exited with an error\n");
+    } else if (!any_output) {
+        _ = safeWrite(self.output_stream, "git diff produced no output\n");
+    }
+    safeFlush(self.output_stream);
+}
+
+fn runGitCommand(self: *Session, argv: []const []const u8) !std.process.Child.RunResult {
+    return std.process.Child.run(.{
+        .allocator = self.allocator,
+        .argv = argv,
+        .cwd = self.tool_executor.sandboxRoot(),
+        .max_output_bytes = 2 * 1024 * 1024,
+    });
+}
+
+fn pathTracked(self: *Session, path: []const u8) bool {
+    const args = [_][]const u8{ "git", "ls-files", "--error-unmatch", path };
+    const result = runGitCommand(self, &args) catch return false;
+    defer {
+        self.allocator.free(result.stdout);
+        self.allocator.free(result.stderr);
+    }
+    return switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
     };
 }

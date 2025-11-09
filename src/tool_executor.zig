@@ -4,6 +4,7 @@ const Tools = @import("tools.zig");
 const list_dir_impl = @import("tools/impl/list_directory.zig");
 const read_file_impl = @import("tools/impl/read_file.zig");
 const search_impl = @import("tools/impl/search.zig");
+const apply_patch_impl = @import("tools/impl/apply_patch.zig");
 const testing = std.testing;
 
 pub const ToolExecutor = struct {
@@ -98,6 +99,18 @@ pub const ToolExecutor = struct {
                 };
                 return Tools.ToolResult{ .success = payload };
             },
+            .apply_patch => {
+                const payload = self.applyPatch(invocation.input_payload) catch |err| switch (err) {
+                    error.InvalidPayload => return self.failure("invalid apply_patch payload"),
+                    error.InvalidPatch => return self.failure("invalid apply_patch diff"),
+                    error.PathOutsideSandbox => return self.failure("patch path escapes sandbox root"),
+                    error.AbsolutePathForbidden => return self.failure("patch paths must be relative"),
+                    error.IoFailure => return self.failure("filesystem error while applying patch"),
+                    error.PatchConflict => return self.failure("apply_patch failed: context does not match current file contents"),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                return Tools.ToolResult{ .success = payload };
+            },
         }
 
         unreachable;
@@ -122,7 +135,7 @@ pub const ToolExecutor = struct {
         return .{ .failure = duped };
     }
 
-    fn ensurePermissions(self: *ToolExecutor, perms: []const Tools.Permission) error{PermissionDenied, WorkspaceWriteRequired}!void {
+    fn ensurePermissions(self: *ToolExecutor, perms: []const Tools.Permission) error{ PermissionDenied, WorkspaceWriteRequired }!void {
         const required = highestPermission(perms);
         switch (required) {
             .read_only => return,
@@ -136,6 +149,7 @@ pub const ToolExecutor = struct {
     const ListDirError = list_dir_impl.Error;
     const ReadFileError = read_file_impl.Error;
     const SearchError = search_impl.Error;
+    const ApplyPatchError = apply_patch_impl.Error;
 
     fn listDirectory(self: *ToolExecutor, payload: []const u8) ListDirError![]u8 {
         return list_dir_impl.run(self, payload);
@@ -147,6 +161,9 @@ pub const ToolExecutor = struct {
 
     fn search(self: *ToolExecutor, payload: []const u8) SearchError![]u8 {
         return search_impl.run(self, payload);
+    }
+    fn applyPatch(self: *ToolExecutor, payload: []const u8) ApplyPatchError![]u8 {
+        return apply_patch_impl.run(self, payload);
     }
 
     const ResolveError = std.mem.Allocator.Error || error{
@@ -231,10 +248,10 @@ test "workspace write permission is enforced until granted" {
     var executor = try ToolExecutor.init(testing.allocator, root, .read_only);
     defer executor.deinit();
 
-    try executor.ensurePermissions(&.{ .read_only });
-    try testing.expectError(error.WorkspaceWriteRequired, executor.ensurePermissions(&.{ .workspace_write }));
+    try executor.ensurePermissions(&.{.read_only});
+    try testing.expectError(error.WorkspaceWriteRequired, executor.ensurePermissions(&.{.workspace_write}));
 
     executor.enableWorkspaceWrite();
-    try executor.ensurePermissions(&.{ .workspace_write });
+    try executor.ensurePermissions(&.{.workspace_write});
     try testing.expect(executor.hasWorkspaceWrite());
 }

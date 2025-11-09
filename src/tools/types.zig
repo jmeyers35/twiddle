@@ -37,6 +37,7 @@ pub const ToolKind = enum {
     list_directory,
     read_file,
     search,
+    apply_patch,
 };
 
 pub const ToolSchema = struct {
