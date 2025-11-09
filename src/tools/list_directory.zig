@@ -1,3 +1,4 @@
+const std = @import("std");
 const types = @import("types.zig");
 
 pub const ListDirectory = struct {
@@ -74,4 +75,14 @@ pub const ListDirectory = struct {
         .parameters = parameters[0..],
         .output_kind = .json_object,
     };
+
+    pub fn emitSummary(writer: *std.Io.Writer, value: std.json.Value) bool {
+        if (value != .object) return false;
+        const entries_val = value.object.get("entries") orelse return false;
+        if (entries_val != .array) return false;
+        const truncated_val = value.object.get("truncated") orelse return false;
+        if (truncated_val != .bool) return false;
+        writer.print(" ({d} entries, truncated={})", .{ entries_val.array.items.len, truncated_val.bool }) catch return false;
+        return true;
+    }
 };

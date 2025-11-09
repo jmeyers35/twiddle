@@ -1,3 +1,4 @@
+const std = @import("std");
 const types = @import("types.zig");
 
 pub const Search = struct {
@@ -90,4 +91,44 @@ pub const Search = struct {
         .parameters = parameters[0..],
         .output_kind = .json_object,
     };
+
+    pub fn emitSummary(writer: *std.Io.Writer, value: std.json.Value) bool {
+        if (value != .object) return false;
+        const engine_val = value.object.get("engine") orelse return false;
+        if (engine_val != .string) return false;
+        const results_val = value.object.get("results") orelse return false;
+        if (results_val != .array) return false;
+        const truncated_val = value.object.get("truncated") orelse return false;
+        if (truncated_val != .bool) return false;
+
+        var notes_count: usize = 0;
+        if (value.object.get("notes")) |notes_val| {
+            switch (notes_val) {
+                .array => notes_count = notes_val.array.items.len,
+                else => return false,
+            }
+        }
+
+        var match_count: ?usize = null;
+        if (value.object.get("stats")) |stats_val| {
+            if (stats_val == .object) {
+                if (stats_val.object.get("matches")) |matches_val| {
+                    match_count = switch (matches_val) {
+                        .integer => |v| blk: {
+                            if (v < 0) break :blk null;
+                            break :blk std.math.cast(usize, v) orelse null;
+                        },
+                        else => null,
+                    };
+                }
+            }
+        }
+
+        if (match_count) |matches| {
+            writer.print(" ({s}, matches={d}, truncated={}, notes={d})", .{ engine_val.string, matches, truncated_val.bool, notes_count }) catch return false;
+        } else {
+            writer.print(" ({s}, results={d}, truncated={}, notes={d})", .{ engine_val.string, results_val.array.items.len, truncated_val.bool, notes_count }) catch return false;
+        }
+        return true;
+    }
 };

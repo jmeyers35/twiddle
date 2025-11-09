@@ -3,8 +3,8 @@ const std = @import("std");
 const ChatClient = @import("../chat_client.zig").ChatClient;
 const Spinner = @import("../spinner.zig").Spinner;
 const SpinnerWriter = @import("../spinner.zig").SpinnerWriter;
-const Tools = @import("../tools.zig");
 const ToolExecutor = @import("../tool_executor.zig").ToolExecutor;
+const Tools = @import("../tools.zig");
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -218,23 +218,20 @@ fn emitToolSuccessSummary(
     raw_payload: []const u8,
     value: ?std.json.Value,
 ) void {
+    const debug_enabled = debugOutputEnabled();
     if (!safeWrite(writer, "tool:")) return;
     if (!safeWrite(writer, tool_id)) return;
-    if (std.mem.eql(u8, tool_id, Tools.ListDirectory.id)) {
-        if (value) |v| {
-            if (listDirectoryStats(v)) |stats| {
-                if (!safePrint(writer, " success ({d} entries, truncated={})\n", .{ stats.entry_count, stats.truncated })) return;
-            } else {
-                if (!safeWrite(writer, " success\n")) return;
-            }
-        } else {
-            if (!safeWrite(writer, " success\n")) return;
-        }
-    } else {
-        if (!safeWrite(writer, " success\n")) return;
+    if (!safeWrite(writer, " success")) return;
+    if (value) |parsed| {
+        _ = emitFriendlyToolSummary(writer, tool_id, parsed);
     }
-    if (!safeWrite(writer, raw_payload)) return;
     if (!safeWrite(writer, "\n")) return;
+
+    if (debug_enabled) {
+        if (!safeWrite(writer, raw_payload)) return;
+        if (!safeWrite(writer, "\n")) return;
+    }
+
     safeFlush(writer);
 }
 
@@ -247,18 +244,21 @@ fn emitToolFailureSummary(writer: *std.Io.Writer, tool_id: []const u8, message: 
     safeFlush(writer);
 }
 
-const ListDirStats = struct {
-    entry_count: usize,
-    truncated: bool,
-};
+fn emitFriendlyToolSummary(writer: *std.Io.Writer, tool_id: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, tool_id, Tools.ListDirectory.id)) {
+        return Tools.ListDirectory.emitSummary(writer, value);
+    }
+    if (std.mem.eql(u8, tool_id, Tools.ReadFile.id)) {
+        return Tools.ReadFile.emitSummary(writer, value);
+    }
+    if (std.mem.eql(u8, tool_id, Tools.Search.id)) {
+        return Tools.Search.emitSummary(writer, value);
+    }
+    return false;
+}
 
 fn safeWrite(writer: *std.Io.Writer, data: []const u8) bool {
     writer.writeAll(data) catch return false;
-    return true;
-}
-
-fn safePrint(writer: *std.Io.Writer, comptime fmt: []const u8, args: anytype) bool {
-    writer.print(fmt, args) catch return false;
     return true;
 }
 
@@ -274,16 +274,8 @@ inline fn jsonStep(res: std.json.Stringify.Error!void) std.mem.Allocator.Error!v
     };
 }
 
-fn listDirectoryStats(value: std.json.Value) ?ListDirStats {
-    if (value != .object) return null;
-    const entries_val = value.object.get("entries") orelse return null;
-    if (entries_val != .array) return null;
-    const truncated_val = value.object.get("truncated") orelse return null;
-    if (truncated_val != .bool) return null;
-    return ListDirStats{
-        .entry_count = entries_val.array.items.len,
-        .truncated = truncated_val.bool,
-    };
+fn debugOutputEnabled() bool {
+    return std.process.hasEnvVarConstant("TWIDDLE_DEBUG");
 }
 
 fn toolErrorMessage(err: anyerror) []const u8 {

@@ -1,3 +1,4 @@
+const std = @import("std");
 const types = @import("types.zig");
 
 pub const ReadFile = struct {
@@ -58,4 +59,16 @@ pub const ReadFile = struct {
             .output_kind = .json_object,
         };
     };
+
+    pub fn emitSummary(writer: *std.Io.Writer, value: std.json.Value) bool {
+        if (value != .object) return false;
+        const mode_val = value.object.get("mode") orelse return false;
+        if (mode_val != .string) return false;
+        const lines_val = value.object.get("lines") orelse return false;
+        if (lines_val != .array) return false;
+        const truncated_val = value.object.get("truncated") orelse return false;
+        if (truncated_val != .bool) return false;
+        writer.print(" ({s} mode, {d} lines, truncated={})", .{ mode_val.string, lines_val.array.items.len, truncated_val.bool }) catch return false;
+        return true;
+    }
 };
