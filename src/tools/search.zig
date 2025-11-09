@@ -86,6 +86,7 @@ pub const Search = struct {
 
     pub const schema = types.ToolSchema{
         .id = id,
+        .kind = .search,
         .summary = "Search files with ripgrep for fast text scans or ast-grep for precise, syntax-aware matches",
         .permissions = &[_]types.Permission{.read_only},
         .parameters = parameters[0..],

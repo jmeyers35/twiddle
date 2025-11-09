@@ -70,6 +70,7 @@ pub const ListDirectory = struct {
 
     pub const schema = types.ToolSchema{
         .id = id,
+        .kind = .list_directory,
         .summary = "List filesystem entries under a sandboxed absolute path",
         .permissions = permissions[0..],
         .parameters = parameters[0..],

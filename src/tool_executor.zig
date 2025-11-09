@@ -45,51 +45,51 @@ pub const ToolExecutor = struct {
         const schema = Tools.findSchema(invocation.tool_id) orelse return error.ToolNotFound;
         try ensureReadOnly(schema.permissions);
 
-        if (std.mem.eql(u8, schema.id, Tools.ListDirectory.id)) {
-            const payload = self.listDirectory(invocation.input_payload) catch |err| switch (err) {
-                error.InvalidPayload => return self.failure("invalid list_directory payload"),
-                error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
-                error.PathNotDirectory => return self.failure("path is not a directory"),
-                error.PathNotFound => return self.failure("path not found"),
-                error.NoEntriesRequested => return self.failure("include_files and include_directories cannot both be false"),
-                error.PermissionDenied => return self.failure("permission denied when reading directory"),
-                error.IoFailure => return self.failure("filesystem error while reading directory"),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            return Tools.ToolResult{ .success = payload };
+        switch (schema.kind) {
+            .list_directory => {
+                const payload = self.listDirectory(invocation.input_payload) catch |err| switch (err) {
+                    error.InvalidPayload => return self.failure("invalid list_directory payload"),
+                    error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
+                    error.PathNotDirectory => return self.failure("path is not a directory"),
+                    error.PathNotFound => return self.failure("path not found"),
+                    error.NoEntriesRequested => return self.failure("include_files and include_directories cannot both be false"),
+                    error.PermissionDenied => return self.failure("permission denied when reading directory"),
+                    error.IoFailure => return self.failure("filesystem error while reading directory"),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                return Tools.ToolResult{ .success = payload };
+            },
+            .read_file => {
+                const payload = self.readFile(invocation.input_payload) catch |err| switch (err) {
+                    error.InvalidPayload => return self.failure("invalid read_file payload"),
+                    error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
+                    error.PathNotFound => return self.failure("path not found"),
+                    error.PathNotFile => return self.failure("path is not a regular file"),
+                    error.OffsetExceedsLength => return self.failure("offset exceeds file length"),
+                    error.AnchorExceedsLength => return self.failure("anchor_line exceeds file length"),
+                    error.PermissionDenied => return self.failure("permission denied when reading file"),
+                    error.IoFailure => return self.failure("filesystem error while reading file"),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                return Tools.ToolResult{ .success = payload };
+            },
+            .search => {
+                const payload = self.search(invocation.input_payload) catch |err| switch (err) {
+                    error.InvalidPayload => return self.failure("invalid search payload"),
+                    error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
+                    error.PathNotFound => return self.failure("path not found"),
+                    error.PermissionDenied => return self.failure("permission denied while running search"),
+                    error.BinaryUnavailable => return self.failure("required search binary not available"),
+                    error.CommandFailed => return self.failure("search command failed"),
+                    error.ToolLimitExceeded => return self.failure("search output exceeded limit"),
+                    error.IoFailure => return self.failure("filesystem error while running search"),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                return Tools.ToolResult{ .success = payload };
+            },
         }
 
-        if (std.mem.eql(u8, schema.id, Tools.ReadFile.id)) {
-            const payload = self.readFile(invocation.input_payload) catch |err| switch (err) {
-                error.InvalidPayload => return self.failure("invalid read_file payload"),
-                error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
-                error.PathNotFound => return self.failure("path not found"),
-                error.PathNotFile => return self.failure("path is not a regular file"),
-                error.OffsetExceedsLength => return self.failure("offset exceeds file length"),
-                error.AnchorExceedsLength => return self.failure("anchor_line exceeds file length"),
-                error.PermissionDenied => return self.failure("permission denied when reading file"),
-                error.IoFailure => return self.failure("filesystem error while reading file"),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            return Tools.ToolResult{ .success = payload };
-        }
-
-        if (std.mem.eql(u8, schema.id, Tools.Search.id)) {
-            const payload = self.search(invocation.input_payload) catch |err| switch (err) {
-                error.InvalidPayload => return self.failure("invalid search payload"),
-                error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
-                error.PathNotFound => return self.failure("path not found"),
-                error.PermissionDenied => return self.failure("permission denied while running search"),
-                error.BinaryUnavailable => return self.failure("required search binary not available"),
-                error.CommandFailed => return self.failure("search command failed"),
-                error.ToolLimitExceeded => return self.failure("search output exceeded limit"),
-                error.IoFailure => return self.failure("filesystem error while running search"),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            return Tools.ToolResult{ .success = payload };
-        }
-
-        return error.ToolUnavailable;
+        unreachable;
     }
 
     pub fn deinitResult(self: *ToolExecutor, result: *Tools.ToolResult) void {

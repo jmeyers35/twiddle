@@ -53,6 +53,7 @@ pub const ReadFile = struct {
 
         break :blk types.ToolSchema{
             .id = id,
+            .kind = .read_file,
             .summary = "Read formatted source lines from a sandboxed file",
             .permissions = &[_]types.Permission{.read_only},
             .parameters = parameters[0..],

@@ -32,8 +32,15 @@ pub const Parameter = struct {
     default_value: ParameterDefault = .none,
 };
 
+pub const ToolKind = enum {
+    list_directory,
+    read_file,
+    search,
+};
+
 pub const ToolSchema = struct {
     id: []const u8,
+    kind: ToolKind,
     summary: []const u8,
     permissions: []const Permission,
     parameters: []const Parameter,

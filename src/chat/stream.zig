@@ -15,6 +15,49 @@ pub const ContextUsage = struct {
     limit_tokens: u32,
 };
 
+const LineBuffer = struct {
+    stack: [512]u8,
+    stack_len: usize = 0,
+    heap: std.ArrayListUnmanaged(u8) = .{},
+    using_heap: bool = false,
+
+    fn init() LineBuffer {
+        return LineBuffer{
+            // SAFETY: stack contents are overwritten before being read.
+            .stack = undefined,
+        };
+    }
+
+    fn append(self: *LineBuffer, allocator: std.mem.Allocator, byte: u8) !void {
+        if (!self.using_heap and self.stack_len < self.stack.len) {
+            self.stack[self.stack_len] = byte;
+            self.stack_len += 1;
+            return;
+        }
+        if (!self.using_heap) {
+            try self.heap.appendSlice(allocator, self.stack[0..self.stack_len]);
+            self.using_heap = true;
+        }
+        try self.heap.append(allocator, byte);
+    }
+
+    fn items(self: *LineBuffer) []const u8 {
+        return if (self.using_heap) self.heap.items else self.stack[0..self.stack_len];
+    }
+
+    fn clear(self: *LineBuffer) void {
+        self.stack_len = 0;
+        if (self.using_heap) {
+            self.heap.clearRetainingCapacity();
+            self.using_heap = false;
+        }
+    }
+
+    fn deinit(self: *LineBuffer, allocator: std.mem.Allocator) void {
+        self.heap.deinit(allocator);
+    }
+};
+
 pub fn streamSse(
     client: anytype,
     response: *std.http.Client.Response,
@@ -27,12 +70,12 @@ pub fn streamSse(
     var reader = response.reader(&transfer_buf);
     var chunk_buf: [2048]u8 = undefined;
 
-    var line_buf = std.ArrayListUnmanaged(u8){};
+    var line_buf = LineBuffer.init();
     defer line_buf.deinit(client.allocator);
     var event_buf: [16 * 1024]u8 = undefined;
     var event_len: usize = 0;
     var done = false;
-    var chunk_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var chunk_arena = std.heap.ArenaAllocator.init(client.allocator);
     defer chunk_arena.deinit();
 
     while (!done) {
@@ -54,8 +97,8 @@ pub fn streamSse(
 
         for (chunk_buf[0..n]) |byte| {
             if (byte == '\n') {
-                const trimmed = trimLine(line_buf.items);
-                line_buf.clearRetainingCapacity();
+                const trimmed = trimLine(line_buf.items());
+                line_buf.clear();
                 if (trimmed.len == 0) {
                     if (event_len > 0) {
                         done = try handleEvent(client, event_buf[0..event_len], writer, usage, &chunk_arena, transcript, tool_accum);
@@ -86,6 +129,8 @@ pub fn streamSse(
     if (!done and event_len > 0) {
         _ = try handleEvent(client, event_buf[0..event_len], writer, usage, &chunk_arena, transcript, tool_accum);
     }
+
+    try writer.flush();
 }
 
 fn handleEvent(
@@ -109,7 +154,22 @@ fn handleEvent(
     try emitChoices(client, root.object, writer, transcript, tool_accum);
     try captureUsage(root.object, usage);
 
+    try writer.flush();
     return false;
+}
+
+fn writeAndCapture(
+    client: anytype,
+    writer: *std.io.Writer,
+    transcript: *std.ArrayListUnmanaged(u8),
+    data: []const u8,
+) !void {
+    if (data.len == 0) return;
+    try writer.writeAll(data);
+    try client.captureTranscript(transcript, data);
+    if (std.mem.indexOfScalar(u8, data, '\n')) |_| {
+        try writer.flush();
+    }
 }
 
 fn emitChoices(
@@ -125,9 +185,7 @@ fn emitChoices(
         if (choice != .object) continue;
         const delta_val = choice.object.get("delta") orelse continue;
         if (delta_val == .string) {
-            try writer.writeAll(delta_val.string);
-            try client.captureTranscript(transcript, delta_val.string);
-            try writer.flush();
+            try writeAndCapture(client, writer, transcript, delta_val.string);
             continue;
         }
         if (delta_val != .object) continue;
@@ -139,9 +197,7 @@ fn emitChoices(
             try emitContent(client, content_val, writer, transcript);
         } else if (delta_obj.get("output_text")) |text_val| {
             if (text_val == .string) {
-                try writer.writeAll(text_val.string);
-                try client.captureTranscript(transcript, text_val.string);
-                try writer.flush();
+                try writeAndCapture(client, writer, transcript, text_val.string);
             }
         }
     }
@@ -155,34 +211,27 @@ fn emitContent(
 ) !void {
     switch (value) {
         .string => |str| {
-            try writer.writeAll(str);
-            try client.captureTranscript(transcript, str);
-            try writer.flush();
+            try writeAndCapture(client, writer, transcript, str);
         },
         .array => |arr| {
             for (arr.items) |item| {
                 if (item == .string) {
-                    try writer.writeAll(item.string);
-                    try client.captureTranscript(transcript, item.string);
+                    try writeAndCapture(client, writer, transcript, item.string);
                 } else if (item == .object) {
                     if (item.object.get("text")) |text_val| {
                         if (text_val == .string) {
-                            try writer.writeAll(text_val.string);
-                            try client.captureTranscript(transcript, text_val.string);
+                            try writeAndCapture(client, writer, transcript, text_val.string);
                         }
                     } else if (item.object.get("content")) |content| {
                         try emitContent(client, content, writer, transcript);
                     }
                 }
             }
-            try writer.flush();
         },
         .object => |obj| {
             if (obj.get("text")) |text_val| {
                 if (text_val == .string) {
-                    try writer.writeAll(text_val.string);
-                    try client.captureTranscript(transcript, text_val.string);
-                    try writer.flush();
+                    try writeAndCapture(client, writer, transcript, text_val.string);
                 }
             }
         },

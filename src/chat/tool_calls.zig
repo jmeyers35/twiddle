@@ -95,10 +95,10 @@ pub const ToolCallAccumulator = struct {
             if (partial.id.len == 0 or partial.name.len == 0) return error.StreamFormat;
 
             const args_len = partial.arguments.items.len;
-            const args_slice = try allocator.alloc(u8, args_len);
-            if (args_len != 0) {
-                @memcpy(args_slice[0..args_len], partial.arguments.items[0..args_len]);
-            }
+            const args_slice = if (args_len == 0) blk: {
+                partial.arguments.deinit(allocator);
+                break :blk try allocator.alloc(u8, 0);
+            } else try partial.arguments.toOwnedSlice(allocator);
 
             out[idx] = msgs.ToolCall{
                 .id = partial.id,
@@ -108,7 +108,7 @@ pub const ToolCallAccumulator = struct {
 
             partial.id = &.{};
             partial.name = &.{};
-            partial.arguments.deinit(allocator);
+            partial.arguments = .{};
         }
 
         self.calls.deinit(allocator);
