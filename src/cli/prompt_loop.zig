@@ -48,7 +48,7 @@ pub const PromptLoop = struct {
             if (trimmed.len == 0) continue;
             if (std.mem.eql(u8, trimmed, "exit")) break;
 
-            var session = app.makeSession(self.stdout_is_tty, self.wait_message, self.output_stream);
+            var session = app.makeSession(self.input_stream, self.stdout_is_tty, self.wait_message, self.output_stream);
             session.run(trimmed) catch |err| switch (err) {
                 error.ToolEnvelopeInvalid => {},
                 else => return err,

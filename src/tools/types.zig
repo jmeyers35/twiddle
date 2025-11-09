@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Permission = enum {
     read_only,
+    workspace_write,
 };
 
 pub const OutputKind = enum {

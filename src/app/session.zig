@@ -1,33 +1,45 @@
 const std = @import("std");
 
 const ChatClient = @import("../chat_client.zig").ChatClient;
+const Config = @import("../config.zig");
 const Spinner = @import("../spinner.zig").Spinner;
 const SpinnerWriter = @import("../spinner.zig").SpinnerWriter;
 const ToolExecutor = @import("../tool_executor.zig").ToolExecutor;
 const Tools = @import("../tools.zig");
+const ascii = std.ascii;
+const testing = std.testing;
 
+/// Represents a single CLI session lifetime (the period between launching and exiting twiddle).
+/// Multiple prompt turns may be handled by the same Session, and approvals persist until the process exits.
 pub const Session = struct {
     allocator: std.mem.Allocator,
     chat_client: *ChatClient,
     tool_executor: *ToolExecutor,
+    input_stream: *std.io.Reader,
     stdout_is_tty: bool,
     wait_message: []const u8,
+    approval_policy: Config.ApprovalPolicy,
     output_stream: *std.io.Writer,
+    workspace_write_denied: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
         chat_client: *ChatClient,
         tool_executor: *ToolExecutor,
+        input_stream: *std.io.Reader,
         stdout_is_tty: bool,
         wait_message: []const u8,
+        approval_policy: Config.ApprovalPolicy,
         output_stream: *std.io.Writer,
     ) Session {
         return .{
             .allocator = allocator,
             .chat_client = chat_client,
             .tool_executor = tool_executor,
+            .input_stream = input_stream,
             .stdout_is_tty = stdout_is_tty,
             .wait_message = wait_message,
+            .approval_policy = approval_policy,
             .output_stream = output_stream,
         };
     }
@@ -132,33 +144,106 @@ pub const Session = struct {
             .input_payload = request.arguments_json,
         };
 
-        var result = self.tool_executor.execute(invocation) catch |err| {
-            const message = toolErrorMessage(err);
-            emitToolFailureSummary(self.output_stream, request.tool_id, message);
-            return formatToolFailureContent(self.allocator, request.tool_id, message);
-        };
-        defer self.tool_executor.deinitResult(&result);
+        retry: while (true) {
+            var result = self.tool_executor.execute(invocation) catch |err| {
+                switch (err) {
+                    error.WorkspaceWriteRequired => {
+                        if (self.handleWorkspaceWriteEscalation(request.tool_id)) continue :retry;
+                        const message = "workspace write access denied";
+                        emitToolFailureSummary(self.output_stream, request.tool_id, message);
+                        return try formatToolFailureContent(self.allocator, request.tool_id, message);
+                    },
+                    else => {
+                        const message = toolErrorMessage(err);
+                        emitToolFailureSummary(self.output_stream, request.tool_id, message);
+                        return try formatToolFailureContent(self.allocator, request.tool_id, message);
+                    },
+                }
+            };
 
-        return switch (result) {
-            .success => |payload| blk: {
-                var arena = std.heap.ArenaAllocator.init(self.allocator);
-                defer arena.deinit();
-                var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), payload, .{}) catch {
-                    const message = "tool returned malformed JSON";
+            defer self.tool_executor.deinitResult(&result);
+
+            return switch (result) {
+                .success => |payload| blk: {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), payload, .{}) catch {
+                        const message = "tool returned malformed JSON";
+                        emitToolFailureSummary(self.output_stream, request.tool_id, message);
+                        break :blk try formatToolFailureContent(self.allocator, request.tool_id, message);
+                    };
+                    defer parsed.deinit();
+                    emitToolSuccessSummary(self.output_stream, request.tool_id, payload, parsed.value);
+                    const copy = try self.allocator.alloc(u8, payload.len);
+                    if (payload.len != 0) @memcpy(copy, payload);
+                    break :blk copy;
+                },
+                .failure => |message| blk: {
                     emitToolFailureSummary(self.output_stream, request.tool_id, message);
                     break :blk try formatToolFailureContent(self.allocator, request.tool_id, message);
-                };
-                defer parsed.deinit();
-                emitToolSuccessSummary(self.output_stream, request.tool_id, payload, parsed.value);
-                const copy = try self.allocator.alloc(u8, payload.len);
-                if (payload.len != 0) @memcpy(copy, payload);
-                break :blk copy;
+                },
+            };
+        }
+    }
+
+    fn handleWorkspaceWriteEscalation(self: *Session, tool_id: []const u8) bool {
+        if (self.tool_executor.hasWorkspaceWrite()) return true;
+        if (self.workspace_write_denied) return false;
+
+        return switch (self.approval_policy) {
+            .never => blk: {
+                _ = safeWrite(self.output_stream, "workspace write request denied (approval_policy=never)\n");
+                safeFlush(self.output_stream);
+                self.workspace_write_denied = true;
+                break :blk false;
             },
-            .failure => |message| blk: {
-                emitToolFailureSummary(self.output_stream, request.tool_id, message);
-                break :blk try formatToolFailureContent(self.allocator, request.tool_id, message);
+            .on_request => self.promptWorkspaceWriteApproval(tool_id),
+        };
+    }
+
+    fn promptWorkspaceWriteApproval(self: *Session, tool_id: []const u8) bool {
+        _ = safeWrite(self.output_stream, "Tool \"");
+        _ = safeWrite(self.output_stream, tool_id);
+        _ = safeWrite(
+            self.output_stream,
+            "\" requests permission to write within the workspace.\nAllow write access for this twiddle session (until you exit)? [y/N]: ",
+        );
+        safeFlush(self.output_stream);
+
+        const maybe_line = self.input_stream.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                std.log.warn("approval response exceeded buffer limit", .{});
+                return false;
+            },
+            else => {
+                std.log.warn("approval response read failed: {s}", .{@errorName(err)});
+                return false;
             },
         };
+        const raw_line = maybe_line orelse {
+            self.workspace_write_denied = true;
+            _ = safeWrite(self.output_stream, "\nworkspace write request skipped (no response)\n");
+            safeFlush(self.output_stream);
+            return false;
+        };
+
+        const without_cr = std.mem.trimRight(u8, raw_line, "\r");
+        const trimmed = std.mem.trim(u8, without_cr, " \t");
+        const approved = isAffirmativeResponse(trimmed);
+        _ = safeWrite(self.output_stream, "\n");
+
+        if (approved) {
+            self.tool_executor.enableWorkspaceWrite();
+            self.workspace_write_denied = false;
+            _ = safeWrite(self.output_stream, "workspace write access granted for this twiddle session\n");
+            safeFlush(self.output_stream);
+            return true;
+        }
+
+        self.workspace_write_denied = true;
+        _ = safeWrite(self.output_stream, "workspace write access denied\n");
+        safeFlush(self.output_stream);
+        return false;
     }
 };
 
@@ -187,6 +272,21 @@ fn detectToolRequest(chat_client: *ChatClient) error{InvalidToolEnvelope}!?ToolR
         };
     }
     return null;
+}
+
+fn isAffirmativeResponse(response: []const u8) bool {
+    if (response.len == 0) return false;
+    if (response.len == 1) return ascii.toLower(response[0]) == 'y';
+    return ascii.eqlIgnoreCase(response, "y") or ascii.eqlIgnoreCase(response, "yes");
+}
+
+test "isAffirmativeResponse handles variants" {
+    try testing.expect(isAffirmativeResponse("y"));
+    try testing.expect(isAffirmativeResponse("Y"));
+    try testing.expect(isAffirmativeResponse("yes"));
+    try testing.expect(isAffirmativeResponse("YES"));
+    try testing.expect(!isAffirmativeResponse("n"));
+    try testing.expect(!isAffirmativeResponse(""));
 }
 
 fn formatToolFailureContent(

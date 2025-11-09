@@ -1,22 +1,31 @@
 const std = @import("std");
+const Config = @import("config.zig");
 const Tools = @import("tools.zig");
 const list_dir_impl = @import("tools/impl/list_directory.zig");
 const read_file_impl = @import("tools/impl/read_file.zig");
 const search_impl = @import("tools/impl/search.zig");
+const testing = std.testing;
 
 pub const ToolExecutor = struct {
     allocator: std.mem.Allocator,
     sandbox_root: []u8,
     sandbox_dir: std.fs.Dir,
+    sandbox_mode: Config.SandboxMode,
+    workspace_write_enabled: bool,
 
     pub const Error = std.mem.Allocator.Error || std.fs.File.OpenError || error{
         InvalidSandbox,
         ToolNotFound,
         PermissionDenied,
         ToolUnavailable,
+        WorkspaceWriteRequired,
     };
 
-    pub fn init(allocator: std.mem.Allocator, sandbox_root: []const u8) Error!ToolExecutor {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        sandbox_root: []const u8,
+        sandbox_mode: Config.SandboxMode,
+    ) Error!ToolExecutor {
         const resolved = try resolveRootPath(allocator, sandbox_root);
         errdefer allocator.free(resolved);
 
@@ -32,6 +41,8 @@ pub const ToolExecutor = struct {
             .allocator = allocator,
             .sandbox_root = resolved,
             .sandbox_dir = dir,
+            .sandbox_mode = sandbox_mode,
+            .workspace_write_enabled = sandbox_mode != .read_only,
         };
     }
 
@@ -43,7 +54,7 @@ pub const ToolExecutor = struct {
 
     pub fn execute(self: *ToolExecutor, invocation: Tools.ToolInvocation) (Error || std.mem.Allocator.Error)!Tools.ToolResult {
         const schema = Tools.findSchema(invocation.tool_id) orelse return error.ToolNotFound;
-        try ensureReadOnly(schema.permissions);
+        try self.ensurePermissions(schema.permissions);
 
         switch (schema.kind) {
             .list_directory => {
@@ -111,9 +122,14 @@ pub const ToolExecutor = struct {
         return .{ .failure = duped };
     }
 
-    fn ensureReadOnly(perms: []const Tools.Permission) error{PermissionDenied}!void {
-        for (perms) |perm| {
-            if (perm != .read_only) return error.PermissionDenied;
+    fn ensurePermissions(self: *ToolExecutor, perms: []const Tools.Permission) error{PermissionDenied, WorkspaceWriteRequired}!void {
+        const required = highestPermission(perms);
+        switch (required) {
+            .read_only => return,
+            .workspace_write => {
+                if (self.workspace_write_enabled) return;
+                return error.WorkspaceWriteRequired;
+            },
         }
     }
 
@@ -156,6 +172,18 @@ pub const ToolExecutor = struct {
     pub fn sandboxRoot(self: *const ToolExecutor) []const u8 {
         return self.sandbox_root;
     }
+
+    pub fn enableWorkspaceWrite(self: *ToolExecutor) void {
+        if (self.workspace_write_enabled) return;
+        self.workspace_write_enabled = true;
+        if (self.sandbox_mode == .read_only) {
+            self.sandbox_mode = .workspace_write;
+        }
+    }
+
+    pub fn hasWorkspaceWrite(self: *const ToolExecutor) bool {
+        return self.workspace_write_enabled;
+    }
 };
 
 fn resolveRootPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -181,4 +209,32 @@ fn pathWithinSandbox(root: []const u8, candidate: []const u8) bool {
     if (candidate.len == root.len) return true;
     const sep = candidate[root.len];
     return sep == std.fs.path.sep;
+}
+
+fn highestPermission(perms: []const Tools.Permission) Tools.Permission {
+    var highest = Tools.Permission.read_only;
+    for (perms) |perm| {
+        if (@intFromEnum(perm) > @intFromEnum(highest)) {
+            highest = perm;
+        }
+    }
+    return highest;
+}
+
+test "workspace write permission is enforced until granted" {
+    var tmp = try testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root);
+
+    var executor = try ToolExecutor.init(testing.allocator, root, .read_only);
+    defer executor.deinit();
+
+    try executor.ensurePermissions(&.{ .read_only });
+    try testing.expectError(error.WorkspaceWriteRequired, executor.ensurePermissions(&.{ .workspace_write }));
+
+    executor.enableWorkspaceWrite();
+    try executor.ensurePermissions(&.{ .workspace_write });
+    try testing.expect(executor.hasWorkspaceWrite());
 }

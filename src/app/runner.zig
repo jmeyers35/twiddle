@@ -51,7 +51,7 @@ pub const Application = struct {
         };
         errdefer chat_client.deinit();
 
-        var tool_executor = ToolExecutor.init(allocator, ".") catch |err| {
+        var tool_executor = ToolExecutor.init(allocator, ".", runtime_config.sandbox_mode) catch |err| {
             try output_stream.writeAll("failed to initialize tool executor: ");
             try output_stream.writeAll(@errorName(err));
             try output_stream.writeAll("\n");
@@ -61,8 +61,8 @@ pub const Application = struct {
 
         const tool_context_message = try std.fmt.allocPrint(
             allocator,
-            "Workspace root: {s}. Provide absolute paths within this root when using tools.",
-            .{tool_executor.sandbox_root},
+            "Workspace root: {s}. Provide absolute paths within this root when using tools. Sandbox mode: {s}.",
+            .{ tool_executor.sandbox_root, Config.sandboxModeLabel(runtime_config.sandbox_mode) },
         );
         defer allocator.free(tool_context_message);
         try chat_client.setToolContext(tool_context_message);
@@ -88,6 +88,7 @@ pub const Application = struct {
 
     pub fn makeSession(
         self: *Application,
+        input_stream: *std.io.Reader,
         stdout_is_tty: bool,
         wait_message: []const u8,
         output_stream: *std.io.Writer,
@@ -96,8 +97,10 @@ pub const Application = struct {
             self.allocator,
             &self.chat_client,
             &self.tool_executor,
+            input_stream,
             stdout_is_tty,
             wait_message,
+            self.runtime_config.approval_policy,
             output_stream,
         );
     }

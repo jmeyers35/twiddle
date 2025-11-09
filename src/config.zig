@@ -2,16 +2,32 @@ const std = @import("std");
 const toml = @import("toml");
 
 const crypto = std.crypto;
+const testing = std.testing;
+
+pub const SandboxMode = enum {
+    read_only,
+    workspace_write,
+    danger_full_access,
+};
+
+pub const ApprovalPolicy = enum {
+    on_request,
+    never,
+};
 
 pub const defaults = struct {
     pub const base_url = "https://openrouter.ai/api";
     pub const model = "openai/gpt-5-codex";
+    pub const sandbox_mode = SandboxMode.read_only;
+    pub const approval_policy = ApprovalPolicy.on_request;
 };
 
 pub const Loaded = struct {
     base_url: []const u8 = defaults.base_url,
     model: []const u8 = defaults.model,
     api_key: ?[]const u8 = null,
+    sandbox_mode: SandboxMode = defaults.sandbox_mode,
+    approval_policy: ApprovalPolicy = defaults.approval_policy,
 
     owned_base_url: ?[]u8 = null,
     owned_model: ?[]u8 = null,
@@ -35,8 +51,10 @@ pub const LoadError = error{
 
 const FileSchema = struct {
     base_url: ?[]const u8 = null,
-    model: ?[]const u8 = null,
-    api_key: ?[]const u8 = null,
+   model: ?[]const u8 = null,
+   api_key: ?[]const u8 = null,
+    sandbox_mode: ?[]const u8 = null,
+    approval_policy: ?[]const u8 = null,
 };
 
 const max_config_bytes = 64 * 1024;
@@ -115,5 +133,57 @@ pub fn load(
         loaded.api_key = loaded.owned_api_key.?;
     }
 
+    if (doc.sandbox_mode) |value| {
+        loaded.sandbox_mode = parseSandboxMode(value) catch return error.ConfigParseFailed;
+    }
+
+    if (doc.approval_policy) |value| {
+        loaded.approval_policy = parseApprovalPolicy(value) catch return error.ConfigParseFailed;
+    }
+
     return loaded;
+}
+
+fn parseSandboxMode(value: []const u8) !SandboxMode {
+    if (std.mem.eql(u8, value, "read-only")) return .read_only;
+    if (std.mem.eql(u8, value, "workspace-write")) return .workspace_write;
+    if (std.mem.eql(u8, value, "danger-full-access")) return .danger_full_access;
+    return error.ConfigParseFailed;
+}
+
+fn parseApprovalPolicy(value: []const u8) !ApprovalPolicy {
+    if (std.mem.eql(u8, value, "on-request")) return .on_request;
+    if (std.mem.eql(u8, value, "never")) return .never;
+    return error.ConfigParseFailed;
+}
+
+pub fn sandboxModeLabel(mode: SandboxMode) []const u8 {
+    return switch (mode) {
+        .read_only => "read-only",
+        .workspace_write => "workspace-write",
+        .danger_full_access => "danger-full-access",
+    };
+}
+
+pub fn approvalPolicyLabel(policy: ApprovalPolicy) []const u8 {
+    return switch (policy) {
+        .on_request => "on-request",
+        .never => "never",
+    };
+}
+
+test "load parses sandbox and approval policy" {
+    var tmp = try testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile("twiddle.toml", "sandbox_mode = \"workspace-write\"\napproval_policy = \"never\"\n");
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, "twiddle.toml");
+    defer testing.allocator.free(path);
+
+    var loaded = try load(testing.allocator, path);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(SandboxMode.workspace_write, loaded.sandbox_mode);
+    try testing.expectEqual(ApprovalPolicy.never, loaded.approval_policy);
 }

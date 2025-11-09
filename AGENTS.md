@@ -13,3 +13,5 @@ This is `twiddle`, and we're on a mission to build the best and most efficient c
 ## Development
 
 - Always run `mise check` after making changes.
+- The tool sandbox starts in read-only mode. Either set `sandbox_mode = "workspace-write"` up front or answer the on-request prompt when a tool needs write access. Interactive approvals are disabled when `approval_policy = "never"`.
+- A “session” spans the entire lifetime of the `twiddle` CLI process. Approvals (for example workspace-write) persist until you exit Twiddle or manually change the sandbox configuration, even if you enter multiple prompts.
