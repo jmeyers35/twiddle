@@ -2,6 +2,7 @@ const std = @import("std");
 const Tools = @import("tools.zig");
 const list_dir_impl = @import("tools/impl/list_directory.zig");
 const read_file_impl = @import("tools/impl/read_file.zig");
+const search_impl = @import("tools/impl/search.zig");
 
 pub const ToolExecutor = struct {
     allocator: std.mem.Allocator,
@@ -73,6 +74,21 @@ pub const ToolExecutor = struct {
             return Tools.ToolResult{ .success = payload };
         }
 
+        if (std.mem.eql(u8, schema.id, Tools.Search.id)) {
+            const payload = self.search(invocation.input_payload) catch |err| switch (err) {
+                error.InvalidPayload => return self.failure("invalid search payload"),
+                error.PathOutsideSandbox => return self.failure("path escapes sandbox root"),
+                error.PathNotFound => return self.failure("path not found"),
+                error.PermissionDenied => return self.failure("permission denied while running search"),
+                error.BinaryUnavailable => return self.failure("required search binary not available"),
+                error.CommandFailed => return self.failure("search command failed"),
+                error.ToolLimitExceeded => return self.failure("search output exceeded limit"),
+                error.IoFailure => return self.failure("filesystem error while running search"),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            return Tools.ToolResult{ .success = payload };
+        }
+
         return error.ToolUnavailable;
     }
 
@@ -103,6 +119,7 @@ pub const ToolExecutor = struct {
 
     const ListDirError = list_dir_impl.Error;
     const ReadFileError = read_file_impl.Error;
+    const SearchError = search_impl.Error;
 
     fn listDirectory(self: *ToolExecutor, payload: []const u8) ListDirError![]u8 {
         return list_dir_impl.run(self, payload);
@@ -110,6 +127,10 @@ pub const ToolExecutor = struct {
 
     fn readFile(self: *ToolExecutor, payload: []const u8) ReadFileError![]u8 {
         return read_file_impl.run(self, payload);
+    }
+
+    fn search(self: *ToolExecutor, payload: []const u8) SearchError![]u8 {
+        return search_impl.run(self, payload);
     }
 
     const ResolveError = std.mem.Allocator.Error || error{
@@ -130,6 +151,10 @@ pub const ToolExecutor = struct {
             return error.PathOutsideSandbox;
         }
         return resolved;
+    }
+
+    pub fn sandboxRoot(self: *const ToolExecutor) []const u8 {
+        return self.sandbox_root;
     }
 };
 

@@ -119,6 +119,7 @@ pub const ChatClient = struct {
                     try emitErrorLine(writer, "upstream error", e);
                     return;
                 },
+                error.ReadFailed => RespondResult.retryable,
                 else => return err,
             };
 
@@ -160,6 +161,7 @@ pub const ChatClient = struct {
                     try emitErrorLine(writer, "upstream error", e);
                     return;
                 },
+                error.ReadFailed => RespondResult.retryable,
                 else => return err,
             };
 

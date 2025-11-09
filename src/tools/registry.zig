@@ -2,10 +2,12 @@ const types = @import("types.zig");
 
 const list_directory = @import("list_directory.zig").ListDirectory;
 const read_file = @import("read_file.zig").ReadFile;
+const search = @import("search.zig").Search;
 
 pub const registry = [_]types.ToolSchema{
     list_directory.schema,
     read_file.schema,
+    search.schema,
 };
 
 pub fn findSchema(id: []const u8) ?*const types.ToolSchema {
