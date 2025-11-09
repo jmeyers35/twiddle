@@ -55,6 +55,26 @@ pub const ToolCallAccumulator = struct {
         try partial.arguments.appendSlice(allocator, chunk);
     }
 
+    pub fn pendingToolCount(self: *const ToolCallAccumulator) usize {
+        var count: usize = 0;
+        for (self.calls.items) |partial| {
+            if (partial.name.len == 0) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn writePendingToolNames(self: *const ToolCallAccumulator, writer: anytype) !usize {
+        var emitted: usize = 0;
+        for (self.calls.items) |partial| {
+            if (partial.name.len == 0) continue;
+            if (emitted != 0) try writer.writeAll(", ");
+            try writer.writeAll(partial.name);
+            emitted += 1;
+        }
+        return emitted;
+    }
+
     pub fn take(self: *ToolCallAccumulator, allocator: Allocator) (Allocator.Error || error{StreamFormat})![]msgs.ToolCall {
         const count = self.calls.items.len;
         if (count == 0) {

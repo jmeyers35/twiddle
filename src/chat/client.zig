@@ -54,6 +54,9 @@ pub const ChatClient = struct {
 
     const min_timeout_ns: u64 = 750 * std.time.ns_per_ms;
     const max_timeout_ns: u64 = 20 * std.time.ns_per_s;
+    const max_retry_attempts: u8 = 4;
+    const base_retry_delay_ns: u64 = 200 * std.time.ns_per_ms;
+    const max_retry_delay_ns: u64 = 2 * std.time.ns_per_s;
 
     pub fn init(allocator: Allocator, config: Config) !ChatClient {
         const uri_storage = try allocator.alloc(u8, config.base_url.len + config.path.len);
@@ -107,7 +110,7 @@ pub const ChatClient = struct {
         try self.appendUserMessage(user_input);
 
         var attempts: u8 = 0;
-        while (true) : (attempts += 1) {
+        while (attempts < max_retry_attempts) : (attempts += 1) {
             var assistant_buf = std.ArrayListUnmanaged(u8){};
             defer assistant_buf.deinit(self.allocator);
 
@@ -132,13 +135,10 @@ pub const ChatClient = struct {
                     return;
                 },
                 .retryable => {
-                    if (attempts >= 1) {
+                    if (!(try self.scheduleRetry(writer, attempts))) {
                         try emitErrorLine(writer, "upstream temporarily unavailable, retry limit hit", null);
                         return;
                     }
-                    try writer.writeAll("…retrying…\n");
-                    try writer.flush();
-                    continue;
                 },
             }
         }
@@ -149,7 +149,7 @@ pub const ChatClient = struct {
         defer snapshot.cancel();
 
         var attempts: u8 = 0;
-        while (true) : (attempts += 1) {
+        while (attempts < max_retry_attempts) : (attempts += 1) {
             var assistant_buf = std.ArrayListUnmanaged(u8){};
             defer assistant_buf.deinit(self.allocator);
 
@@ -174,13 +174,10 @@ pub const ChatClient = struct {
                     return;
                 },
                 .retryable => {
-                    if (attempts >= 1) {
+                    if (!(try self.scheduleRetry(writer, attempts))) {
                         try emitErrorLine(writer, "upstream temporarily unavailable, retry limit hit", null);
                         return;
                     }
-                    try writer.writeAll("…retrying…\n");
-                    try writer.flush();
-                    continue;
                 },
             }
         }
@@ -249,6 +246,10 @@ pub const ChatClient = struct {
         var stream_usage: Usage = .{};
         try stream_mod.streamSse(self, &response, writer, &stream_usage, transcript, tool_accum);
 
+        if (transcript.items.len == 0) {
+            try emitToolRequestPlaceholder(writer, tool_accum);
+        }
+
         if (stream_usage.valid) {
             if (self.model_context_limit) |limit| {
                 if (contextUsage(limit, stream_usage.total_tokens)) |usage_info| {
@@ -261,6 +262,46 @@ pub const ChatClient = struct {
         try writer.writeAll("\n");
 
         return RespondResult.success;
+    }
+
+    fn emitToolRequestPlaceholder(writer: *Writer, tool_accum: *const ToolCallAccumulator) !void {
+        if (tool_accum.pendingToolCount() == 0) return;
+        try writer.writeAll("(requesting tools: ");
+        _ = try tool_accum.writePendingToolNames(writer);
+        try writer.writeAll(")\n");
+        try writer.flush();
+    }
+
+    fn scheduleRetry(self: *ChatClient, writer: *Writer, attempt_index: u8) !bool {
+        _ = self;
+        if (attempt_index + 1 >= max_retry_attempts) return false;
+        const delay_ns = computeRetryDelayNs(attempt_index);
+        try emitRetryDelay(writer, delay_ns);
+        std.Thread.sleep(delay_ns);
+        return true;
+    }
+
+    fn computeRetryDelayNs(attempt_index: u8) u64 {
+        var delay = base_retry_delay_ns;
+        var idx: u8 = 0;
+        while (idx < attempt_index) : (idx += 1) {
+            if (delay >= max_retry_delay_ns) break;
+            delay = @min(delay * 2, max_retry_delay_ns);
+        }
+        const jitter_cap = @min(delay / 4, 200 * std.time.ns_per_ms);
+        var jitter: u64 = 0;
+        if (jitter_cap != 0) {
+            jitter = crypto.random.intRangeAtMost(u64, 0, jitter_cap);
+        }
+        return delay + jitter;
+    }
+
+    fn emitRetryDelay(writer: *Writer, delay_ns: u64) !void {
+        var buf: [64]u8 = undefined;
+        const delay_ms = delay_ns / std.time.ns_per_ms;
+        const line = try std.fmt.bufPrint(&buf, "…retrying in {d}ms…\n", .{delay_ms});
+        try writer.writeAll(line);
+        try writer.flush();
     }
 
     fn forwardErrorBody(
